@@ -49,16 +49,16 @@ export const GEO_NAME_JA: Record<number, string> = {
 
 /** 露出面の基本色。企画の「色を見れば分かる」の根拠。茶 / 灰 / 黄。 */
 export const GEO_COLOR: Record<number, [number, number, number]> = {
-  [Geo.Soil]: [0.42, 0.29, 0.17],
-  [Geo.Rock]: [0.44, 0.45, 0.47],
-  [Geo.Weak]: [0.76, 0.66, 0.24],
+  [Geo.Soil]: [0.40, 0.27, 0.15],
+  [Geo.Rock]: [0.32, 0.33, 0.35],
+  [Geo.Weak]: [0.70, 0.58, 0.17],
 };
 
 /** 掘削速度 [m^3/s]。岩は遅く、軟弱層は速い。手応えで地質が分かるようにする。 */
 export const DIG_RATE: Record<number, number> = {
-  [Geo.Soil]: 6.0,
-  [Geo.Rock]: 1.6,
-  [Geo.Weak]: 9.0,
+  [Geo.Soil]: 14.0,
+  [Geo.Rock]: 3.5,
+  [Geo.Weak]: 20.0,
 };
 
 /** 掘削単価 [金/m^3]。 */

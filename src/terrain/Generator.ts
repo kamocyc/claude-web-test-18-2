@@ -70,9 +70,12 @@ function buildStrataMaps(): StrataMaps {
 
       height[o] = clamp(h, 3.5, 58);
 
-      // --- 岩盤上面。ところどころ地表を突き抜けて露岩になる。 ---
-      rockTop[o] =
-        height[o] - 13 + 9 * n.fbm2(x * 0.017 + 40.7, z * 0.017 - 12.1, 3) - 2 * Math.sin(x * 0.05);
+      // --- 岩盤上面 ---
+      // 「地表からの土被り」で定義し、これが負になる場所を作ることで露岩にする。
+      // 露岩が無いと岩が画面に出てこず、「岩盤を狙って遠回りする」判断が成立しない。
+      const rockDepth =
+        5.5 + 22 * n.fbm2(x * 0.017 + 40.7, z * 0.017 - 12.1, 3) - 1.5 * Math.sin(x * 0.05);
+      rockTop[o] = height[o] - rockDepth;
 
       // --- 軟弱レンズ: 緩く傾いた板 + マスクで存在範囲を切る ---
       const mask = nWeak.fbm2(x * 0.014 - 7.7, z * 0.014 + 3.3, 3);

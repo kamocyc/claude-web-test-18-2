@@ -2,18 +2,31 @@ import * as THREE from 'three';
 import { Engine } from './core/Engine';
 import { CameraRig } from './core/CameraRig';
 import { Time } from './core/Time';
+import { Input } from './core/Input';
 import { Hud } from './ui/Hud';
+import { Toolbar, type ToolId } from './ui/Toolbar';
 import { VoxelField } from './terrain/VoxelField';
 import { generate } from './terrain/Generator';
 import { ChunkManager } from './terrain/ChunkManager';
 import { createTerrainMaterial } from './terrain/TerrainMaterial';
-import { WORLD_X, WORLD_Z, WATER_TABLE_Y } from './terrain/config';
+import { raycastTerrain, type RayHit } from './terrain/raymarch';
+import { applyCapsule } from './terrain/Edit';
+import { Economy } from './game/Economy';
+import { Excavator } from './game/Excavator';
+import { BrushCursor } from './game/BrushCursor';
+import {
+  WORLD_X, WORLD_Z, WATER_TABLE_Y, GEO_NAME_JA, GEO_COLOR, Geo,
+} from './terrain/config';
 
 const container = document.getElementById('app')!;
 const engine = new Engine(container);
 const rig = new CameraRig(engine.camera, engine.canvas);
 const time = new Time();
 const hud = new Hud();
+const input = new Input(engine.canvas);
+const toolbar = new Toolbar();
+const economy = new Economy();
+const excavator = new Excavator();
 
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
@@ -35,9 +48,8 @@ const chunks = new ChunkManager(field, debugMat ?? terrainMat.material);
 chunks.buildAll();
 engine.scene.add(chunks.group);
 
-const meshMs = chunks.stats.lastRemeshMs;
 console.info(
-  `[terrain] generate ${genMs.toFixed(0)}ms, mesh ${meshMs.toFixed(0)}ms, ` +
+  `[terrain] generate ${genMs.toFixed(0)}ms, mesh ${chunks.stats.lastRemeshMs.toFixed(0)}ms, ` +
   `${chunks.stats.meshedChunks} chunks, ${chunks.stats.triangles.toFixed(0)} tris, ` +
   `SharedArrayBuffer=${field.shared}`,
 );
@@ -58,27 +70,118 @@ waterPlane.position.set(WORLD_X / 2, WATER_TABLE_Y, WORLD_Z / 2);
 waterPlane.renderOrder = 2;
 engine.scene.add(waterPlane);
 
+// --- ブラシカーソル ---
+const cursor = new BrushCursor();
+cursor.setRadius(excavator.radius);
+engine.scene.add(cursor.object);
+
 // --- カメラ初期位置: 尾根と谷が両方入る俯瞰 ---
 rig.lookAt(
   new THREE.Vector3(WORLD_X * 0.5, 22, WORLD_Z * 0.5),
   new THREE.Vector3(WORLD_X * 0.5 - 78, 74, WORLD_Z * 0.5 + 96),
 );
 
-// --- 速度キー ---
+// --- ツール切り替え ---
+toolbar.onChange = (t: ToolId) => {
+  rig.setDigMode(t !== 'look');
+  if (t === 'dig' || t === 'fill') excavator.mode = t;
+  excavator.end();
+};
+
+// --- キー ---
 window.addEventListener('keydown', (e) => {
   if (e.key === '0') time.speed = 0;
   if (e.key === '1') time.speed = 1;
   if (e.key === '2') time.speed = 2;
   if (e.key === '3') time.speed = 4;
+  if (e.key === '[') {
+    excavator.radius = Math.max(1.2, excavator.radius - 0.4);
+    cursor.setRadius(excavator.radius);
+  }
+  if (e.key === ']') {
+    excavator.radius = Math.min(8, excavator.radius + 0.4);
+    cursor.setRadius(excavator.radius);
+  }
 });
+
+// --- ループ ---
+const rayOrigin = new THREE.Vector3();
+const rayDir = new THREE.Vector3();
+let hoverGeo: Geo = Geo.Soil;
+let hoverDepth = 0;
+let lastCost = 0;
+
+function swatch(g: Geo): string {
+  const c = GEO_COLOR[g];
+  const hex = '#' + [c[0], c[1], c[2]]
+    .map((v) => Math.round(Math.min(1, v * 1.4) * 255).toString(16).padStart(2, '0'))
+    .join('');
+  return `<span class="swatch" style="background:${hex}"></span>${GEO_NAME_JA[g]}`;
+}
 
 function frame(): void {
   requestAnimationFrame(frame);
   time.tick();
   rig.update();
+
+  const tool = toolbar.current;
+  let hit: RayHit | null = null;
+
+  if (tool !== 'look' && input.inside) {
+    input.rayOrigin(engine.camera, rayOrigin);
+    input.rayDirection(engine.camera, rayDir);
+    hit = raycastTerrain(field, rayOrigin, rayDir);
+  }
+
+  if (hit) {
+    hoverGeo = field.materialAt(hit.point.x, hit.point.y, hit.point.z);
+    hoverDepth = hit.point.y;
+    cursor.show(hit, hoverGeo, excavator.mode);
+  } else {
+    cursor.hide();
+  }
+
+  // 掘削の開始 / 継続 / 終了
+  if (tool !== 'look') {
+    if (input.primaryPressed && hit) excavator.begin(hit, rayDir);
+    if (!input.primaryDown && excavator.isActive) excavator.end();
+
+    if (excavator.isActive) {
+      const dt = time.realDelta * time.speed;
+      const res = excavator.update(field, chunks, dt, hit, rayDir);
+      if (res && res.changed) {
+        lastCost = economy.chargeExcavation(res.volumeByGeo);
+      }
+    }
+  } else if (excavator.isActive) {
+    excavator.end();
+  }
+
   chunks.update(6);
-  hud.update(time, chunks.stats);
+
+  // --- HUD ---
+  const rows: string[] = [];
+  rows.push(`<div class="row"><span class="k">資金</span><span class="v">¥${Math.round(economy.money).toLocaleString()}</span></div>`);
+  rows.push(`<div class="row"><span class="k">残土</span><span class="v">${economy.spoil.toFixed(0)} m³</span></div>`);
+  if (hit) {
+    rows.push(`<div class="row"><span class="k">地質</span><span class="v">${swatch(hoverGeo)}</span></div>`);
+    rows.push(
+      `<div class="row"><span class="k">標高</span><span class="v">${hoverDepth.toFixed(1)} m` +
+      (hoverDepth < WATER_TABLE_Y ? ' <span style="color:#6cc0e8">水位下</span>' : '') +
+      '</span></div>',
+    );
+  }
+  if (excavator.isActive) {
+    rows.push(
+      `<div class="row"><span class="k">掘進</span><span class="v">${excavator.headSpeed.toFixed(2)} m/s</span></div>`,
+    );
+    rows.push(`<div class="row"><span class="k">直近費用</span><span class="v">¥${lastCost.toFixed(0)}</span></div>`);
+  }
+  rows.push(`<div class="row"><span class="k">ブラシ</span><span class="v">R ${excavator.radius.toFixed(1)} m</span></div>`);
+  hud.update(time, chunks.stats, rows.join(''));
+
   engine.render();
+  input.endFrame();
 }
 frame();
 
@@ -90,20 +193,35 @@ declare global {
       rig: CameraRig;
       field: VoxelField;
       chunks: ChunkManager;
+      economy: Economy;
+      excavator: Excavator;
+      toolbar: Toolbar;
       ready: boolean;
-      /** カメラを任意の位置・注視点へ即座に飛ばす */
       view(from: [number, number, number], at: [number, number, number]): void;
+      /** テスト用: ワールド座標の折れ線に沿って一気に掘る */
+      carve(path: [number, number, number][], radius: number): void;
     };
   }
 }
 
 window.__game = {
-  engine,
-  rig,
-  field,
-  chunks,
+  engine, rig, field, chunks, economy, excavator, toolbar,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
+  },
+  carve(path, radius) {
+    // 検証用。Excavator の速度制限を通さずに直接カプセルを適用する。
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1];
+      const b = path[i];
+      const res = applyCapsule(
+        field, chunks,
+        a[0], a[1], a[2], b[0], b[1], b[2],
+        radius, 'dig', excavator.blend, Geo.Soil,
+      );
+      if (res.changed) economy.chargeExcavation(res.volumeByGeo);
+    }
+    chunks.update(100000);
   },
 };
