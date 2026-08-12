@@ -49,8 +49,36 @@ export class BrushCursor {
     this.object.visible = false;
   }
 
+  /**
+   * 支保ツールで狙っている区間を示す。
+   * 坑道の断面に合わせた輪を、地形を透かして出す。
+   * どこを押せばどの区間に入るのかが分からないと、
+   * 山の外から警告柱を狙っているのに手応えが無い、という状態になる。
+   */
+  showAtSegment(pos: THREE.Vector3, dir: THREE.Vector3, radius: number): void {
+    this.object.visible = true;
+    this.object.position.copy(pos);
+    this.ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+    this.ring.position.set(0, 0, 0);
+    this.ring.scale.setScalar(radius * 1.18);
+    this.ringMat.color.set(0x9fe8ff);
+    this.ringMat.depthTest = false;
+    this.ball.scale.setScalar(radius);
+    this.ballMat.color.set(0x66d0ff);
+    this.ballMat.opacity = 0.1;
+  }
+
+  /** 掘削カーソルの見た目に戻す。 */
+  private restore(): void {
+    this.ring.scale.setScalar(this._radius);
+    this.ball.scale.setScalar(this._radius);
+    this.ringMat.depthTest = false;
+    this.ballMat.opacity = 0.12;
+  }
+
   show(hit: RayHit, geo: Geo, mode: 'dig' | 'fill'): void {
     this.object.visible = true;
+    this.restore();
     this.object.position.copy(hit.point);
     // 輪を法線に合わせて寝かせる
     this.ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), hit.normal);

@@ -6,7 +6,7 @@ import { Input } from './core/Input';
 import { Hud } from './ui/Hud';
 import { Toolbar, toolSupportLevel, type ToolId } from './ui/Toolbar';
 import { Alerts } from './ui/Alerts';
-import { TunnelNetwork } from './game/Tunnel';
+import { TunnelNetwork, type TunnelSegment } from './game/Tunnel';
 import { TunnelView } from './game/TunnelView';
 import { supportName } from './game/Support';
 import { SurveySystem, SurveyView, BORING_COST_PER_M, BORING_DEPTH } from './game/Survey';
@@ -124,6 +124,7 @@ const rayOrigin = new THREE.Vector3();
 const rayDir = new THREE.Vector3();
 let lastPreviewMs = 0;
 let previewHtml = '';
+let aimSeg: TunnelSegment | null = null;
 let hoverGeo: Geo = Geo.Soil;
 let hoverDepth = 0;
 let lastCost = 0;
@@ -150,15 +151,15 @@ function frame(): void {
     hit = raycastTerrain(field, rayOrigin, rayDir);
   }
 
-  if (hit) {
+  const supLevel = toolSupportLevel(tool);
+
+  if (supLevel === 0 && hit) {
     hoverGeo = field.materialAt(hit.point.x, hit.point.y, hit.point.z);
     hoverDepth = hit.point.y;
     cursor.show(hit, hoverGeo, excavator.mode);
-  } else {
+  } else if (supLevel === 0) {
     cursor.hide();
   }
-
-  const supLevel = toolSupportLevel(tool);
 
   // --- 掘削の開始 / 継続 / 終了 ---
   if (tool === 'dig' || tool === 'fill') {
@@ -192,15 +193,32 @@ function frame(): void {
       tunnels.endBore();
     }
     // --- 支保の設置 ---
-    if (supLevel > 0 && input.primaryDown && hit) {
-      const targets = tunnels.within(hit.point, excavator.radius * 2.2, []);
-      for (const seg of targets) {
-        if (!tunnels.queueInstall(seg, supLevel, economy) && economy.money < 1000) {
-          alerts.flash('資金が足りない');
-          break;
+    // 狙いは「地表のヒット点の近く」ではなく「カーソルのレイが貫く区間」で採る。
+    // ヒット点で採ると、山の外から狙ったときヒット点が地表にあり、
+    // 坑道までは土被りぶん離れているので何も選べない。
+    if (supLevel > 0) {
+      input.rayOrigin(engine.camera, rayOrigin);
+      input.rayDirection(engine.camera, rayDir);
+      aimSeg = input.inside
+        ? tunnels.nearestToRay(rayOrigin, rayDir, excavator.radius * 1.6)
+        : null;
+
+      if (aimSeg && input.primaryDown) {
+        // 狙った区間を中心に、その前後をまとめて予約する (なぞって塗れるように)
+        const targets = tunnels.within(aimSeg.pos, excavator.radius * 2.2, []);
+        for (const seg of targets) {
+          if (!tunnels.queueInstall(seg, supLevel, economy) && economy.money < 1000) {
+            alerts.flash('資金が足りない');
+            break;
+          }
         }
       }
+    } else {
+      aimSeg = null;
     }
+
+    if (aimSeg) cursor.showAtSegment(aimSeg.pos, aimSeg.dir, aimSeg.radius);
+    else if (supLevel > 0) cursor.hide();
 
     // --- ボーリング調査 ---
     if (tool === 'boring' && input.primaryPressed && hit) {
@@ -297,10 +315,25 @@ function frame(): void {
     previewHtml = '';
   }
 
-  // カーソル下のトンネル区間の状態
-  if (hit) {
-    const seg = tunnels.nearest(hit.point, excavator.radius * 2.5);
+  // カーソル下のトンネル区間の状態。
+  // 支保ツールのときは「実際に設置される区間」を出す (狙いと表示を一致させる)。
+  {
+    const seg = supLevel > 0
+      ? aimSeg
+      : hit ? tunnels.nearest(hit.point, excavator.radius * 2.5) : null;
+    if (supLevel > 0 && !seg) {
+      rows.push(
+        '<div class="row"><span class="k">狙い</span>' +
+        '<span class="v" style="color:#93a0b4">区間なし — 坑道か警告柱を狙う</span></div>',
+      );
+    }
     if (seg) {
+      if (supLevel > 0) {
+        rows.push(
+          `<div class="row"><span class="k">狙い</span>` +
+          `<span class="v" style="color:#9fe8ff">この区間 ±${(excavator.radius * 2.2).toFixed(0)} m</span></div>`,
+        );
+      }
       rows.push(
         `<div class="row"><span class="k">土被り</span><span class="v">${seg.cover.toFixed(1)} m</span></div>`,
       );

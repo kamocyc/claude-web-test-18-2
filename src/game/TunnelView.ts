@@ -12,7 +12,8 @@ import { supportDef } from './Support';
  *   木枠 (L1)   … 細いリングが飛び飛び。あいだから地山がそのまま見える
  *   覆工 (L2)   … 連続した滑らかな覆工チューブ。地山が完全に隠れる
  *   鋼製 (L3)   … 覆工チューブ + 太いリブ。いちばん重装備に見える
- *   支保不足    … 黄→赤に明滅するリング。崩落が近いほど速い
+ *   支保不足    … 橙→赤に明滅するリング。崩落が近いほど速い
+ *                 (色 = 足りているか、形 = 何が入っているか)
  *   崩落済み    … 暗い赤
  *
  * さらに支保不足の区間からは地表へ警告柱を立てる (深度テストを切ってあるので
@@ -94,12 +95,22 @@ export class TunnelView {
 
   private static colorFor(seg: TunnelSegment, out: THREE.Color): THREE.Color {
     if (seg.collapsed) return out.setHex(0x4a2620);
+
+    // 支保不足の判定を最優先にする。
+    // 「支保が入っているか」を先に見ると、木枠しか入っていないのに鋼製が要る区間が
+    // 木枠の茶色で表示され、劣化中なのに手当て済みに見えてしまう。
+    // 足りているかどうかが色、何が入っているかは形 (リング / チューブ / リブ) で表す。
+    if (seg.installed < seg.required) {
+      // 健全度が落ちるほど橙→赤へ。
+      // 黄色から始めると軟弱層 (黄) の壁に溶けて警告に見えないので、
+      // 満健全度でも橙赤から始める。地質の色 (茶/灰/黄) とぶつからない帯にしておく。
+      return out.setRGB(1, 0.05 + 0.30 * seg.integrity, 0.05 + 0.10 * seg.integrity);
+    }
+
     if (seg.installed > 0) {
       return out.setHex(supportDef(seg.installed)?.color ?? 0xaaaaaa);
     }
-    if (seg.installed >= seg.required) return out.setHex(0x5c6b7a); // 岩・無支保で足りている
-    // 支保不足: 健全度が落ちるほど赤へ
-    return out.setRGB(1, 0.78 * seg.integrity, 0.12 * seg.integrity);
+    return out.setHex(0x5c6b7a); // 岩などで、無支保のまま足りている
   }
 
   sync(net: TunnelNetwork): void {
@@ -197,7 +208,8 @@ export class TunnelView {
       if (!seg) continue;
       const speed = 2 + (1 - Math.max(0, seg.integrity)) * 10;
       const k = 0.5 + 0.5 * Math.sin(this.t * speed);
-      _c.setRGB(1, 0.75 * seg.integrity, 0.1).multiplyScalar(0.55 + 0.45 * k);
+      _c.setRGB(1, 0.05 + 0.30 * seg.integrity, 0.05 + 0.10 * seg.integrity)
+        .multiplyScalar(0.55 + 0.45 * k);
       this.beams.setColorAt(i, _c);
     }
     if (this.beams.instanceColor) this.beams.instanceColor.needsUpdate = true;

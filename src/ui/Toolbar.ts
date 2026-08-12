@@ -13,9 +13,9 @@ const TOOLS: ToolDef[] = [
   { id: 'look', label: '見る', key: 'Q', hint: '左ドラッグで回転' },
   { id: 'dig', label: '掘る', key: 'W', hint: '左ドラッグで掘削 / 右ドラッグで回転' },
   { id: 'fill', label: '盛る', key: 'E', hint: '左ドラッグで盛土 / 右ドラッグで回転' },
-  { id: 'sup1', label: '木枠', key: 'A', hint: 'トンネルをなぞって木枠 (L1) を設置', support: 1 },
-  { id: 'sup2', label: '覆工', key: 'S', hint: 'トンネルをなぞってコンクリート覆工 (L2) を設置', support: 2 },
-  { id: 'sup3', label: '鋼製', key: 'D', hint: 'トンネルをなぞって鋼製支保+排水 (L3) を設置', support: 3 },
+  { id: 'sup1', label: '木枠', key: 'A', hint: '坑道か警告柱を狙ってドラッグ → 木枠 (L1)。狙った区間の前後 6 m に入る', support: 1 },
+  { id: 'sup2', label: '覆工', key: 'S', hint: '坑道か警告柱を狙ってドラッグ → コンクリート覆工 (L2)。狙った区間の前後 6 m に入る', support: 2 },
+  { id: 'sup3', label: '鋼製', key: 'D', hint: '坑道か警告柱を狙ってドラッグ → 鋼製支保+排水 (L3)。狙った区間の前後 6 m に入る', support: 3 },
   { id: 'boring', label: '調査', key: 'Z', hint: 'クリックでボーリング調査。周囲 9 m の地質が分かる' },
   { id: 'section', label: '断面', key: 'X', hint: '地表をドラッグして断面線を引く。裏付けの無い地質は伏せられる' },
 ];

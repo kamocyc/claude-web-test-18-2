@@ -508,7 +508,42 @@ export class TunnelNetwork {
     return { atRisk, worst, tunnels, collapsed };
   }
 
-  /** カーソル位置に最も近いセグメント (支保設置ツール用)。 */
+  /**
+   * カーソルのレイが貫く区間のうち、手前のもの。支保ツールの狙いに使う。
+   *
+   * 地表のヒット点からの距離で選んではいけない。山の外から狙うと
+   * ヒット点は地表にあり、坑道までは土被りぶん (5〜15 m) 離れているので
+   * 何も選べない。警告柱が外から見えているのに押せない、という状態になる。
+   * レイとの距離で選べば、柱を狙えばその下の区間が取れる。
+   *
+   * @param dir 正規化済みであること
+   * @param maxPerp レイからこの距離までの区間を拾う [m]
+   */
+  nearestToRay(
+    origin: THREE.Vector3,
+    dir: THREE.Vector3,
+    maxPerp: number,
+  ): TunnelSegment | null {
+    let best: TunnelSegment | null = null;
+    let bestT = Infinity;
+    const maxPerp2 = maxPerp * maxPerp;
+    for (const s of this.segments) {
+      if (s.collapsed || !s.isTunnel) continue;
+      _pp.subVectors(s.pos, origin);
+      const t = _pp.dot(dir);
+      if (t <= 0) continue; // 背後
+      const perp2 = _pp.lengthSq() - t * t;
+      if (perp2 > maxPerp2) continue;
+      // レイに乗っているもののうち、いちばん手前を採る
+      if (t < bestT) {
+        bestT = t;
+        best = s;
+      }
+    }
+    return best;
+  }
+
+  /** カーソル位置に最も近いセグメント。 */
   nearest(p: THREE.Vector3, maxDist: number): TunnelSegment | null {
     let best: TunnelSegment | null = null;
     let bestD = maxDist * maxDist;
