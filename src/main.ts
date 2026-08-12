@@ -218,6 +218,19 @@ function frame(): void {
 
   // --- トンネルの評価・施工・劣化・崩落 ---
   tunnels.update(field, chunks, time.gameDelta);
+
+  // 支保不足は、健全度が落ちてからではなく「不足が確定した瞬間」に知らせる。
+  // 掘っている最中にその場で出るので、掘り進むか支保を入れるかを即座に選べる。
+  if (tunnels.newlyAtRisk.length > 0) {
+    const w = tunnels.newlyAtRisk.reduce((a, b) =>
+      TunnelNetwork.hoursToFailure(b) < TunnelNetwork.hoursToFailure(a) ? b : a,
+    );
+    alerts.flash(
+      `⚠ ${GEO_NAME_JA[w.worstGeo]}${w.belowWater ? '・水位下' : ''} — ` +
+      `${supportName(w.required)} が必要 / あと ${Alerts.fmtHours(TunnelNetwork.hoursToFailure(w))}`,
+    );
+  }
+
   for (const c of tunnels.recentCollapses) {
     tunnelView.burst(c.pos, excavator.radius * 1.3);
     alerts.flash(c.daylight ? '崩落 — 地表が陥没した' : '崩落 — 坑道が埋まった');
@@ -310,6 +323,7 @@ declare global {
       survey: SurveySystem;
       section: SectionView;
       THREE: typeof THREE;
+      TunnelNetwork: typeof TunnelNetwork;
       ready: boolean;
       view(from: [number, number, number], at: [number, number, number]): void;
       /** テスト用: ワールド座標の折れ線に沿って一気に掘る */
@@ -322,7 +336,7 @@ declare global {
 
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
-  survey, section, THREE,
+  survey, section, THREE, TunnelNetwork,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));

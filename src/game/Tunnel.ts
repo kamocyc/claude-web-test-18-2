@@ -73,6 +73,8 @@ export interface TunnelSegment {
   /** 施工残り時間 [ゲーム内時間]。0 なら施工していない。 */
   installRemaining: number;
   installTarget: number;
+  /** 支保不足をすでに警告したか。支保が足りたら降ろして、再発時にまた出す。 */
+  warned: boolean;
 }
 
 export interface CollapseEvent {
@@ -104,6 +106,13 @@ export class TunnelNetwork {
 
   /** この更新で起きた崩落。演出と警告に使う。 */
   readonly recentCollapses: CollapseEvent[] = [];
+  /**
+   * この更新で新たに支保不足になった区間。掘った瞬間に警告を出すために使う。
+   * recentCollapses ともども **次の update() の先頭で捨てられる**ので、
+   * update() を呼んだ側が同じフレームのうちに読むこと。
+   * 二重に update() を呼ぶと、あいだのイベントは誰にも読まれずに消える。
+   */
+  readonly newlyAtRisk: TunnelSegment[] = [];
   /** 直近の更新でジオメトリが変わったか (描画更新の要否)。 */
   dirtyVisuals = true;
 
@@ -135,6 +144,7 @@ export class TunnelNetwork {
       collapsed: false,
       installRemaining: 0,
       installTarget: 0,
+      warned: false,
     };
     this.segments.push(seg);
     this.byId.set(seg.id, seg);
@@ -251,6 +261,7 @@ export class TunnelNetwork {
     gameDelta: number,
   ): void {
     this.recentCollapses.length = 0;
+    this.newlyAtRisk.length = 0;
 
     // --- 地形変化を受けたセグメントの再評価 (件数に上限をつける) ---
     if (this.pending.size > 0) {
@@ -265,6 +276,22 @@ export class TunnelNetwork {
         if (++n >= REEVAL_PER_TICK) break;
       }
       this.dirtyVisuals = true;
+    }
+
+    // --- 支保不足の検出は時間が止まっていても走らせる ---
+    // 健全度が目に見えて落ちてから知らせたのでは遅い。
+    // 不足しているという事実は掘った (あるいは土被りが減った) 瞬間に確定するので、
+    // その時点で警告する。1 段階不足なら余命 80 時間あり、まだ十分間に合う。
+    for (const seg of this.segments) {
+      if (seg.collapsed || !seg.isTunnel) continue;
+      const short = seg.installed < seg.required;
+      if (short && !seg.warned) {
+        seg.warned = true;
+        this.newlyAtRisk.push(seg);
+      } else if (!short && seg.warned) {
+        // 支保が足りたら警告を降ろす。後でまた足りなくなったら出し直す。
+        seg.warned = false;
+      }
     }
 
     if (gameDelta <= 0) return;
@@ -354,6 +381,16 @@ export class TunnelNetwork {
       );
     }
     this.index.remove(seg.id);
+  }
+
+  /**
+   * 崩落までの残り時間 [ゲーム内時間]。足りていれば Infinity。
+   * 割合より「あと何時間」のほうが、支保を入れるか掘り進むかの判断に直結する。
+   */
+  static hoursToFailure(seg: TunnelSegment): number {
+    const deficit = seg.required - seg.installed;
+    if (deficit <= 0 || seg.collapsed || !seg.isTunnel) return Infinity;
+    return (Math.max(0, seg.integrity) * HOURS_TO_FAIL_BASE) / (deficit * deficit);
   }
 
   /** 支保が足りていないセグメントの数と、いちばん危ないものを返す。 */

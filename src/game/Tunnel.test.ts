@@ -47,6 +47,7 @@ function segAt(x: number, y: number, z: number): TunnelSegment {
     collapsed: false,
     installRemaining: 0,
     installTarget: 0,
+    warned: false,
   };
 }
 
@@ -127,6 +128,53 @@ describe('必要支保レベル', () => {
     expect(s.isTunnel).toBe(false);
     // 溝を掘っただけの所に支保を要求してはいけない
     expect(s.required).toBe(0);
+  });
+
+  it('支保不足は時間が止まっていても即座に警告される', () => {
+    // 健全度が目に見えて落ちてから知らせたのでは遅い。
+    // 掘った瞬間に不足が確定するので、その時点で出す。
+    const n = new TunnelNetwork();
+    const weak = segAt(X_WEAK, DEEP_Y, 60);
+    n.evaluate(field, weak);
+    expect(weak.required).toBeGreaterThan(0);
+    n.segments.push(weak);
+
+    // gameDelta = 0 (一時停止中) でも警告が出ること
+    n.update(field, null as never, 0);
+    expect(n.newlyAtRisk).toHaveLength(1);
+    expect(n.newlyAtRisk[0]).toBe(weak);
+
+    // 二度は出さない
+    n.update(field, null as never, 0);
+    expect(n.newlyAtRisk).toHaveLength(0);
+
+    // 支保が足りたら警告を降ろし、また足りなくなれば出し直す
+    weak.installed = weak.required;
+    n.update(field, null as never, 0);
+    expect(n.newlyAtRisk).toHaveLength(0);
+    weak.installed = 0;
+    n.update(field, null as never, 0);
+    expect(n.newlyAtRisk).toHaveLength(1);
+  });
+
+  it('崩落までの残り時間は不足段階の 2 乗で縮む', () => {
+    const s = segAt(X_WEAK, DEEP_Y, 60);
+    s.required = 3;
+    s.installed = 2;
+    s.integrity = 1;
+    const d1 = TunnelNetwork.hoursToFailure(s);
+    s.installed = 0;
+    const d3 = TunnelNetwork.hoursToFailure(s);
+    expect(d1).toBeCloseTo(80, 5);
+    expect(d3).toBeCloseTo(80 / 9, 5);
+
+    // 健全度が減れば残り時間も比例して減る
+    s.integrity = 0.5;
+    expect(TunnelNetwork.hoursToFailure(s)).toBeCloseTo(d3 / 2, 5);
+
+    // 足りていれば崩落しない
+    s.installed = 3;
+    expect(TunnelNetwork.hoursToFailure(s)).toBe(Infinity);
   });
 
   it('必要 0 の区間には支保を予約できない (金と施工班の無駄)', () => {

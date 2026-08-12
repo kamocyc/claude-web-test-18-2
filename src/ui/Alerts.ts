@@ -14,7 +14,12 @@ export class Alerts {
   constructor() {
     const style = document.createElement('style');
     style.textContent = `
-      #alerts { top: 12px; right: 12px; padding: 9px 12px; min-width: 210px; max-width: 280px; }
+      #alerts { top: 12px; right: 12px; padding: 9px 12px; min-width: 232px; max-width: 300px; }
+      #alerts.risk { border-color: #c8703a; background: rgba(48,28,16,.88); }
+      #alerts.urgent { border-color: #e05a4a; background: rgba(58,20,16,.9); animation: pulse 1s infinite; }
+      @keyframes pulse { 50% { border-color: #ff9a86; } }
+      #alerts .big { font-size: 15px; font-weight: 600; color: #ffd0a8; margin: 2px 0 4px; }
+      #alerts .big.urgent { color: #ffb3a6; }
       #alerts .title { color: #93a0b4; margin-bottom: 5px; }
       #alerts .seg { display: flex; align-items: center; gap: 7px; margin: 3px 0; }
       #alerts .bar { flex: 1; height: 5px; background: rgba(255,255,255,.12); border-radius: 3px; overflow: hidden; }
@@ -40,6 +45,13 @@ export class Alerts {
     this.toast.className = 'panel';
     this.toast.id = 'toast';
     document.body.appendChild(this.toast);
+  }
+
+  static fmtHours(h: number): string {
+    if (!Number.isFinite(h)) return '—';
+    if (h < 1) return `${Math.max(1, Math.round(h * 60))} 分`;
+    if (h < 48) return `${h.toFixed(1)} 時間`;
+    return `${(h / 24).toFixed(1)} 日`;
   }
 
   flash(message: string): void {
@@ -68,12 +80,26 @@ export class Alerts {
       '</div>',
     ];
 
+    this.root.classList.remove('risk', 'urgent');
+
     if (st.atRisk === 0) {
       parts.push('<div class="ok">支保は足りている</div>');
     } else {
-      parts.push(`<div style="color:#e8b45c">支保不足 ${st.atRisk} 区間</div>`);
       const w = st.worst;
+      const hours = w ? TunnelNetwork.hoursToFailure(w) : Infinity;
+      // 残り 12 時間を切ったら「今すぐ手を打つ」段階として扱う
+      const urgent = hours < 12;
+      this.root.classList.add(urgent ? 'urgent' : 'risk');
+
+      parts.push(
+        `<div class="big${urgent ? ' urgent' : ''}">⚠ 支保不足 ${st.atRisk} 区間</div>`,
+      );
       if (w) {
+        // 割合ではなく残り時間を主役にする。
+        // 「あと何時間で落ちるか」のほうが、支保を入れるか掘り進むかの判断に直結する。
+        parts.push(
+          `<div class="big${urgent ? ' urgent' : ''}">あと ${Alerts.fmtHours(hours)} で崩落</div>`,
+        );
         const pct = Math.max(0, w.integrity) * 100;
         const col = pct > 50 ? '#e8c05c' : pct > 20 ? '#e08b4a' : '#e05a4a';
         parts.push(
@@ -86,6 +112,7 @@ export class Alerts {
           `${w.belowWater ? '・水位下' : ''} → 必要 ${supportName(w.required)}` +
           ` / 現状 ${supportName(w.installed)}</div>`,
         );
+        parts.push('<div class="n">画面の光る柱が危険な区間。A / S / D でなぞって支保を入れる</div>');
       }
     }
 
