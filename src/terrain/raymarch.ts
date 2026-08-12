@@ -119,16 +119,52 @@ export function raycastTerrain(
 }
 
 /**
- * 真上へ向かって地表までの距離 (土被り) を測る。
- * トンネルが「本当に地中にあるか」の判定に使う。
- * 天井まで固体が続いたまま抜けなければ Infinity。
+ * 坑道の真上にある地山の厚み (土被り) を測る。
+ *
+ * 呼び出し側は坑道の**天端** (中心 + 半径) を y に渡す。
+ * ただしそこを起点にいきなり測ると、まだ坑道の中に入っていることがある。
+ * スムーズ差のブレンド幅ぶん、空洞が名目半径より少し広がるためで、
+ * 素朴に測るとすぐ空気に当たって土被り 0 と誤判定し、
+ * ちゃんと地中を掘っていてもトンネルとして登録されなくなる。
+ *
+ * そこで 3 段階で測る:
+ *   1. 残っている空洞を上へ抜ける
+ *      (抜けきる前に maxVoid を超えたら、空に開いている = 土被り 0)
+ *   2. 最初に固体に当たった高さを地山の下端とする
+ *   3. 固体が続く間を数える。その厚みが土被り
+ *
+ * 起点が最初から固体なら 1 は素通りするので、まだ掘っていない地山にも
+ * そのまま使える。掘る前の下見と掘った後の判定が同じ物差しになるのが大事で、
+ * ここがずれると「下見ではトンネルと言っていたのに掘ったらならない」が起きる。
+ *
+ * @param maxVoid 天端から上に許容する空洞の高さ [m]。ブレンド幅の食い込みを
+ *                吸収するためのもので、これを超えたら空に開いているとみなす。
  */
-export function coverDepthAt(field: VoxelField, x: number, y: number, z: number, maxUp = 80): number {
+export function overburdenAt(
+  field: VoxelField,
+  x: number, y: number, z: number,
+  maxVoid: number,
+  maxUp = 80,
+): number {
   const step = CELL * 0.5;
-  for (let t = step; t <= maxUp; t += step) {
-    const yy = y + t;
-    if (yy > WORLD_Y) return t;
-    if (field.sample(x, yy, z) <= 0) {
+
+  // 1) 空洞を抜ける
+  let t = 0;
+  while (t <= maxVoid) {
+    if (y + t > WORLD_Y) return 0;
+    if (field.sample(x, y + t, z) > 0) break;
+    t += step;
+  }
+  if (t > maxVoid) return 0; // 天井が無い = 空に開いている
+
+  // 2) 地山の下端
+  const base = t;
+
+  // 3) 固体が続く厚みを測る
+  while (t < maxUp) {
+    t += step;
+    if (y + t > WORLD_Y) return t - base;
+    if (field.sample(x, y + t, z) <= 0) {
       // 二分で詰める
       let lo = t - step;
       let hi = t;
@@ -137,8 +173,8 @@ export function coverDepthAt(field: VoxelField, x: number, y: number, z: number,
         if (field.sample(x, y + mid, z) <= 0) hi = mid;
         else lo = mid;
       }
-      return hi;
+      return hi - base;
     }
   }
-  return Infinity;
+  return maxUp - base;
 }

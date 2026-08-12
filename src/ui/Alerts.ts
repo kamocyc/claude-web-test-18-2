@@ -1,6 +1,6 @@
 import { GEO_NAME_JA } from '../terrain/config';
 import { TunnelNetwork } from '../game/Tunnel';
-import { supportName } from '../game/Support';
+import { supportName, supportDef } from '../game/Support';
 
 /**
  * 支保不足と崩落の警告。
@@ -26,6 +26,7 @@ export class Alerts {
       #alerts .bar i { display: block; height: 100%; }
       #alerts .n { font-variant-numeric: tabular-nums; color: #c8d0dc; font-size: 11px; }
       #alerts .ok { color: #7fc98a; }
+      #alerts .built { display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 4px 0; font-size: 11px; color: #c8d0dc; }
       #toast {
         top: 50%; left: 50%; transform: translate(-50%,-50%);
         padding: 14px 22px; font-size: 15px; font-weight: 600;
@@ -81,6 +82,23 @@ export class Alerts {
     ];
 
     this.root.classList.remove('risk', 'urgent');
+
+    // 設置済み支保の内訳。坑内に入らなくても「どれだけ巻いたか」が分かるように。
+    const inst = [0, 0, 0, 0];
+    for (const s of net.segments) {
+      if (s.collapsed || !s.isTunnel) continue;
+      inst[Math.min(3, Math.max(0, s.installed))]++;
+    }
+    const built = [1, 2, 3]
+      .filter((l) => inst[l] > 0)
+      .map((l) => {
+        const d = supportDef(l)!;
+        const hex = '#' + d.color.toString(16).padStart(6, '0');
+        return `<span><span class="swatch" style="background:${hex}"></span>${d.name} ${inst[l]}</span>`;
+      });
+    if (built.length > 0) {
+      parts.push(`<div class="built">${built.join('')}</div>`);
+    }
 
     if (st.atRisk === 0) {
       parts.push('<div class="ok">支保は足りている</div>');

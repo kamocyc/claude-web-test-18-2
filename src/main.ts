@@ -15,7 +15,7 @@ import { VoxelField } from './terrain/VoxelField';
 import { generate } from './terrain/Generator';
 import { ChunkManager } from './terrain/ChunkManager';
 import { createTerrainMaterial } from './terrain/TerrainMaterial';
-import { raycastTerrain, type RayHit } from './terrain/raymarch';
+import { raycastTerrain, overburdenAt, type RayHit } from './terrain/raymarch';
 import { applyCapsule } from './terrain/Edit';
 import { Economy } from './game/Economy';
 import { Excavator } from './game/Excavator';
@@ -122,6 +122,8 @@ window.addEventListener('keydown', (e) => {
 // --- ループ ---
 const rayOrigin = new THREE.Vector3();
 const rayDir = new THREE.Vector3();
+let lastPreviewMs = 0;
+let previewHtml = '';
 let hoverGeo: Geo = Geo.Soil;
 let hoverDepth = 0;
 let lastCost = 0;
@@ -265,6 +267,36 @@ function frame(): void {
     rows.push(`<div class="row"><span class="k">直近費用</span><span class="v">¥${lastCost.toFixed(0)}</span></div>`);
   }
 
+  // 掘る前の下見。「掘っているのに何も起きない」の正体は、
+  // たいてい斜面を下りながら地表すれすれを削っているだけ (土被りがつかない)。
+  // 場を歩くので毎フレームは重い。8 Hz に間引いて結果を使い回す。
+  if (hit && tool === 'dig') {
+    const now = performance.now();
+    if (now - lastPreviewMs > 125) {
+      lastPreviewMs = now;
+      const pv = tunnels.previewBore(field, hit.point, rayDir, excavator.radius);
+      previewHtml = pv.found
+        ? `<div class="row"><span class="k">この向き</span>` +
+          `<span class="v" style="color:#8fd0a0">` +
+          (pv.dist <= excavator.radius * 1.5
+            ? 'トンネル'
+            : `あと ${pv.dist.toFixed(0)} m でトンネル`) +
+          `</span></div>` +
+          `<div class="row"><span class="k">土被り</span>` +
+          `<span class="v">${pv.seg.cover.toFixed(1)} m</span></div>` +
+          `<div class="row"><span class="k">必要支保</span><span class="v"` +
+          (pv.seg.required > 0 ? ' style="color:#e8b45c"' : '') +
+          `>${supportName(pv.seg.required)}</span></div>`
+        : `<div class="row"><span class="k">この向き</span>` +
+          `<span class="v" style="color:#93a0b4">切土 — 潜れない</span></div>` +
+          `<div class="row"><span class="k"></span>` +
+          `<span class="v" style="color:#93a0b4;font-size:11px">斜面を見上げる向きに差す</span></div>`;
+    }
+    rows.push(previewHtml);
+  } else {
+    previewHtml = '';
+  }
+
   // カーソル下のトンネル区間の状態
   if (hit) {
     const seg = tunnels.nearest(hit.point, excavator.radius * 2.5);
@@ -324,6 +356,8 @@ declare global {
       section: SectionView;
       THREE: typeof THREE;
       TunnelNetwork: typeof TunnelNetwork;
+      raycastTerrain: typeof raycastTerrain;
+      overburdenAt: typeof overburdenAt;
       ready: boolean;
       view(from: [number, number, number], at: [number, number, number]): void;
       /** テスト用: ワールド座標の折れ線に沿って一気に掘る */
@@ -336,7 +370,7 @@ declare global {
 
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
-  survey, section, THREE, TunnelNetwork,
+  survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));

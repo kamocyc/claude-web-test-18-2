@@ -3,7 +3,7 @@ import {
   CELL, Geo, GEO_SUPPORT_REQ, GEO_NAME_JA, WATER_TABLE_Y,
 } from '../terrain/config';
 import { applyCapsule } from '../terrain/Edit';
-import { coverDepthAt } from '../terrain/raymarch';
+import { overburdenAt } from '../terrain/raymarch';
 import { clamp } from '../terrain/FieldMath';
 import type { VoxelField } from '../terrain/VoxelField';
 import type { ChunkManager } from '../terrain/ChunkManager';
@@ -40,8 +40,12 @@ export const SEGMENT_LENGTH = 2.0;
  */
 const HOURS_TO_FAIL_BASE = 80;
 
-/** 土被りがこの倍率より薄ければトンネル扱いしない (切土・坑口)。 */
-const COVER_TUNNEL_MIN = 1.5;
+/**
+ * 土被りがこの倍率より薄ければトンネル扱いしない (切土・坑口)。
+ * 半径 2.6 m のブラシなら 3.1 m。溝を掘っただけの所を除くには十分で、
+ * これ以上厳しくすると坑口からトンネル成立まで掘り進む距離が長くなりすぎる。
+ */
+const COVER_TUNNEL_MIN = 1.2;
 /** 土被りがこの倍率より薄ければ必要支保 +1。 */
 const COVER_SHALLOW = 3.0;
 
@@ -85,6 +89,7 @@ export interface CollapseEvent {
 const _u = new THREE.Vector3();
 const _v = new THREE.Vector3();
 const _p = new THREE.Vector3();
+const _pp = new THREE.Vector3();
 
 /** dir に垂直な正規直交基底を作る。 */
 function basis(dir: THREE.Vector3, u: THREE.Vector3, v: THREE.Vector3): void {
@@ -92,6 +97,25 @@ function basis(dir: THREE.Vector3, u: THREE.Vector3, v: THREE.Vector3): void {
   u.crossVectors(dir, a).normalize();
   v.crossVectors(dir, u).normalize();
 }
+
+/** preview() 用の使い回しセグメント。毎フレーム呼ばれるので確保し直さない。 */
+const PREVIEW: TunnelSegment = {
+  id: -1,
+  pos: new THREE.Vector3(),
+  dir: new THREE.Vector3(0, 0, 1),
+  radius: 1,
+  worstGeo: Geo.Soil,
+  required: 0,
+  installed: 0,
+  integrity: 1,
+  cover: 0,
+  belowWater: false,
+  isTunnel: false,
+  collapsed: false,
+  installRemaining: 0,
+  installTarget: 0,
+  warned: false,
+};
 
 export class TunnelNetwork {
   readonly segments: TunnelSegment[] = [];
@@ -123,8 +147,8 @@ export class TunnelNetwork {
 
     // 地表付近の整地までセグメントにすると邪魔なので、
     // 記録の時点で土被りが無いものは捨てる。
-    const cover = coverDepthAt(field, head.x, head.y + radius * 1.05, head.z);
-    if (Number.isFinite(cover) && cover < radius * COVER_TUNNEL_MIN) {
+    const cover = overburdenAt(field, head.x, head.y + radius, head.z, radius);
+    if (cover < radius * COVER_TUNNEL_MIN) {
       this.lastRecord = head.clone();
       return;
     }
@@ -175,9 +199,10 @@ export class TunnelNetwork {
   evaluate(field: VoxelField, seg: TunnelSegment): void {
     if (seg.collapsed) return;
 
-    // --- 土被り。坑道の天端から真上へ measure する。 ---
-    const coverRaw = coverDepthAt(field, seg.pos.x, seg.pos.y + seg.radius * 1.05, seg.pos.z);
-    seg.cover = Number.isFinite(coverRaw) ? coverRaw : 60;
+    // --- 土被り。天端から測る (残った空洞は overburdenAt が抜けてくれる) ---
+    seg.cover = overburdenAt(
+      field, seg.pos.x, seg.pos.y + seg.radius, seg.pos.z, seg.radius,
+    );
     seg.isTunnel = seg.cover >= seg.radius * COVER_TUNNEL_MIN;
     seg.belowWater = seg.pos.y < WATER_TABLE_Y;
 
@@ -217,6 +242,58 @@ export class TunnelNetwork {
 
     seg.required = clamp(required, 0, 3);
     seg.worstGeo = worstGeo;
+  }
+
+  /**
+   * 掘る前の下見。「ここを掘ったらトンネルになるのか、支保は何が要るのか」を
+   * セグメントを作らずに評価して返す。返り値は使い回しなので保持しないこと。
+   *
+   * これが無いと、地表すれすれを削っているだけなのか本当に潜れているのかが
+   * プレイヤーに分からない。斜面を下りながら掘ると地形のほうが速く落ちて
+   * いつまでも土被りがつかず、「掘っているのに何も起きない」に見えてしまう。
+   */
+  preview(
+    field: VoxelField,
+    pos: THREE.Vector3,
+    dir: THREE.Vector3,
+    radius: number,
+  ): TunnelSegment {
+    const s = PREVIEW;
+    s.pos.copy(pos);
+    s.dir.copy(dir).normalize();
+    s.radius = radius;
+    s.collapsed = false;
+    s.installed = 0;
+    s.integrity = 1;
+    this.evaluate(field, s);
+    return s;
+  }
+
+  /**
+   * この向きに掘り進んだら、どこでトンネルになるか。
+   *
+   * 坑口では土被りが 0 なのが当たり前なので、カーソル位置だけを見ても
+   * 「切土」としか出ず何の役にも立たない。知りたいのは
+   * 「このまま押し込んだら潜れるのか、潜れたとして何が要るのか」なので、
+   * 掘進方向へ進みながら最初にトンネル成立する所を探して返す。
+   *
+   * @returns found=false なら、その向きでは maxDist 進んでも潜れない
+   */
+  previewBore(
+    field: VoxelField,
+    origin: THREE.Vector3,
+    dir: THREE.Vector3,
+    radius: number,
+    maxDist = 34,
+  ): { found: boolean; dist: number; seg: TunnelSegment } {
+    const step = 1.5;
+    let last = PREVIEW;
+    for (let d = radius; d <= maxDist; d += step) {
+      _pp.copy(dir).multiplyScalar(d).add(origin);
+      last = this.preview(field, _pp, dir, radius);
+      if (last.isTunnel) return { found: true, dist: d, seg: last };
+    }
+    return { found: false, dist: maxDist, seg: last };
   }
 
   /** 地形が変わった範囲のセグメントを再評価キューに積む。 */
