@@ -1,17 +1,27 @@
-export type ToolId = 'look' | 'dig' | 'fill';
+export type ToolId = 'look' | 'dig' | 'fill' | 'sup1' | 'sup2' | 'sup3';
 
 interface ToolDef {
   id: ToolId;
   label: string;
   key: string;
   hint: string;
+  /** 支保ツールなら設置するレベル。 */
+  support?: number;
 }
 
 const TOOLS: ToolDef[] = [
   { id: 'look', label: '見る', key: 'Q', hint: '左ドラッグで回転' },
   { id: 'dig', label: '掘る', key: 'W', hint: '左ドラッグで掘削 / 右ドラッグで回転' },
   { id: 'fill', label: '盛る', key: 'E', hint: '左ドラッグで盛土 / 右ドラッグで回転' },
+  { id: 'sup1', label: '木枠', key: 'A', hint: 'トンネルをなぞって木枠 (L1) を設置', support: 1 },
+  { id: 'sup2', label: '覆工', key: 'S', hint: 'トンネルをなぞってコンクリート覆工 (L2) を設置', support: 2 },
+  { id: 'sup3', label: '鋼製', key: 'D', hint: 'トンネルをなぞって鋼製支保+排水 (L3) を設置', support: 3 },
 ];
+
+/** そのツールが設置する支保レベル。支保ツールでなければ 0。 */
+export function toolSupportLevel(id: ToolId): number {
+  return TOOLS.find((t) => t.id === id)?.support ?? 0;
+}
 
 /** 画面下中央のツール選択。キーボードでも切り替えられる。 */
 export class Toolbar {
@@ -55,6 +65,7 @@ export class Toolbar {
     }
 
     window.addEventListener('keydown', (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       const t = TOOLS.find((x) => x.key.toLowerCase() === e.key.toLowerCase());
       if (t) this.select(t.id);
     });

@@ -4,7 +4,11 @@ import { CameraRig } from './core/CameraRig';
 import { Time } from './core/Time';
 import { Input } from './core/Input';
 import { Hud } from './ui/Hud';
-import { Toolbar, type ToolId } from './ui/Toolbar';
+import { Toolbar, toolSupportLevel, type ToolId } from './ui/Toolbar';
+import { Alerts } from './ui/Alerts';
+import { TunnelNetwork } from './game/Tunnel';
+import { TunnelView } from './game/TunnelView';
+import { supportName } from './game/Support';
 import { VoxelField } from './terrain/VoxelField';
 import { generate } from './terrain/Generator';
 import { ChunkManager } from './terrain/ChunkManager';
@@ -27,6 +31,9 @@ const input = new Input(engine.canvas);
 const toolbar = new Toolbar();
 const economy = new Economy();
 const excavator = new Excavator();
+const tunnels = new TunnelNetwork();
+const tunnelView = new TunnelView();
+const alerts = new Alerts();
 
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
@@ -74,6 +81,7 @@ engine.scene.add(waterPlane);
 const cursor = new BrushCursor();
 cursor.setRadius(excavator.radius);
 engine.scene.add(cursor.object);
+engine.scene.add(tunnelView.object);
 
 // --- カメラ初期位置: 尾根と谷が両方入る俯瞰 ---
 rig.lookAt(
@@ -86,6 +94,7 @@ toolbar.onChange = (t: ToolId) => {
   rig.setDigMode(t !== 'look');
   if (t === 'dig' || t === 'fill') excavator.mode = t;
   excavator.end();
+  tunnels.endBore();
 };
 
 // --- キー ---
@@ -141,23 +150,60 @@ function frame(): void {
     cursor.hide();
   }
 
-  // 掘削の開始 / 継続 / 終了
-  if (tool !== 'look') {
+  const supLevel = toolSupportLevel(tool);
+
+  // --- 掘削の開始 / 継続 / 終了 ---
+  if (tool === 'dig' || tool === 'fill') {
     if (input.primaryPressed && hit) excavator.begin(hit, rayDir);
-    if (!input.primaryDown && excavator.isActive) excavator.end();
+    if (!input.primaryDown && excavator.isActive) {
+      excavator.end();
+      tunnels.endBore();
+    }
 
     if (excavator.isActive) {
       const dt = time.realDelta * time.speed;
       const res = excavator.update(field, chunks, dt, hit, rayDir);
       if (res && res.changed) {
         lastCost = economy.chargeExcavation(res.volumeByGeo);
+        // 地形が変わった範囲の構造物を再評価キューに積む。
+        // 「崩落は後から地面が変わったときだけ」がここで成立する。
+        tunnels.markDirtyByAABB(
+          res.min[0], res.min[1], res.min[2],
+          res.max[0], res.max[1], res.max[2],
+        );
+        if (tool === 'dig') {
+          tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
+        }
       }
     }
-  } else if (excavator.isActive) {
-    excavator.end();
+  } else {
+    if (excavator.isActive) {
+      excavator.end();
+      tunnels.endBore();
+    }
+    // --- 支保の設置 ---
+    if (supLevel > 0 && input.primaryDown && hit) {
+      const targets = tunnels.within(hit.point, excavator.radius * 2.2, []);
+      for (const seg of targets) {
+        if (!tunnels.queueInstall(seg, supLevel, economy) && economy.money < 1000) {
+          alerts.flash('資金が足りない');
+          break;
+        }
+      }
+    }
   }
 
   chunks.update(6);
+
+  // --- トンネルの評価・施工・劣化・崩落 ---
+  tunnels.update(field, chunks, time.gameDelta);
+  for (const c of tunnels.recentCollapses) {
+    tunnelView.burst(c.pos, excavator.radius * 1.3);
+    alerts.flash(c.daylight ? '崩落 — 地表が陥没した' : '崩落 — 坑道が埋まった');
+  }
+  tunnelView.sync(tunnels);
+  tunnelView.update(time.realDelta);
+  alerts.update(tunnels, time.realDelta);
 
   // --- HUD ---
   const rows: string[] = [];
@@ -177,6 +223,29 @@ function frame(): void {
     );
     rows.push(`<div class="row"><span class="k">直近費用</span><span class="v">¥${lastCost.toFixed(0)}</span></div>`);
   }
+
+  // カーソル下のトンネル区間の状態
+  if (hit) {
+    const seg = tunnels.nearest(hit.point, excavator.radius * 2.5);
+    if (seg) {
+      rows.push(
+        `<div class="row"><span class="k">土被り</span><span class="v">${seg.cover.toFixed(1)} m</span></div>`,
+      );
+      const short = seg.installed < seg.required;
+      rows.push(
+        `<div class="row"><span class="k">支保</span><span class="v"` +
+        (short ? ' style="color:#e8b45c"' : '') +
+        `>${supportName(seg.installed)} / 必要 ${supportName(seg.required)}</span></div>`,
+      );
+      if (short) {
+        rows.push(
+          `<div class="row"><span class="k">健全度</span><span class="v">` +
+          `${(Math.max(0, seg.integrity) * 100).toFixed(0)}%</span></div>`,
+        );
+      }
+    }
+  }
+
   rows.push(`<div class="row"><span class="k">ブラシ</span><span class="v">R ${excavator.radius.toFixed(1)} m</span></div>`);
   hud.update(time, chunks.stats, rows.join(''));
 
@@ -196,16 +265,20 @@ declare global {
       economy: Economy;
       excavator: Excavator;
       toolbar: Toolbar;
+      tunnels: TunnelNetwork;
+      time: Time;
       ready: boolean;
       view(from: [number, number, number], at: [number, number, number]): void;
       /** テスト用: ワールド座標の折れ線に沿って一気に掘る */
       carve(path: [number, number, number][], radius: number): void;
+      /** テスト用: 折れ線に沿って掘りつつトンネル区間も記録する */
+      bore(path: [number, number, number][], radius: number): void;
     };
   }
 }
 
 window.__game = {
-  engine, rig, field, chunks, economy, excavator, toolbar,
+  engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
@@ -222,6 +295,28 @@ window.__game = {
       );
       if (res.changed) economy.chargeExcavation(res.volumeByGeo);
     }
+    chunks.update(100000);
+  },
+  bore(path, radius) {
+    const dir = new THREE.Vector3();
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1];
+      const b = path[i];
+      const res = applyCapsule(
+        field, chunks,
+        a[0], a[1], a[2], b[0], b[1], b[2],
+        radius, 'dig', excavator.blend, Geo.Soil,
+      );
+      if (!res.changed) continue;
+      economy.chargeExcavation(res.volumeByGeo);
+      tunnels.markDirtyByAABB(
+        res.min[0], res.min[1], res.min[2],
+        res.max[0], res.max[1], res.max[2],
+      );
+      dir.set(b[0] - a[0], b[1] - a[1], b[2] - a[2]).normalize();
+      tunnels.recordBore(field, new THREE.Vector3(b[0], b[1], b[2]), dir, radius);
+    }
+    tunnels.endBore();
     chunks.update(100000);
   },
 };

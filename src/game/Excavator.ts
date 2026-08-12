@@ -46,6 +46,11 @@ export class Excavator {
     return this.active;
   }
 
+  /** 掘削ヘッドの現在位置。トンネル中心線の記録に使う。 */
+  get headPosition(): THREE.Vector3 {
+    return this.head;
+  }
+
   /**
    * ヘッドは地表の「手前」、ブラシ球が地表に接する位置から始める。
    * 地表の上に中心を置くと初手でいきなり球ぶんの大穴 (半径 2.6 m なら 70 m^3) が
