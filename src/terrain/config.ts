@@ -83,6 +83,25 @@ export const GEO_SUPPORT_REQ: Record<number, number> = {
   [Geo.Weak]: 2,
 };
 
+/**
+ * 安息角 [度]。これより急な法面は自重で崩れて、この角度まで寝る。
+ *
+ * 岩を 78 度にしてあるのは「岩は崩れない」を別の規則として書きたくないから。
+ * 同じ規則の中で桁違いに大きい値を持たせれば、切土がほぼ直立のまま立つ。
+ * 実際の岩盤法面 (1:0.3 = 73 度) より少し急なだけで、桁外れの嘘ではない。
+ *
+ * この 3 つの差がそのまま地上の判断になる。岩は法面が狭くて済むが掘るのが高い、
+ * 軟弱層は掘るのは安いが法面が寝て用地と手間を食う。
+ */
+export const REPOSE_DEG: Record<number, number> = {
+  [Geo.Soil]: 34,
+  [Geo.Rock]: 78,
+  [Geo.Weak]: 26,
+};
+
+/** 地下水位より下は飽和して安息角が落ちる [度]。軟弱層なら 18 度まで寝る。 */
+export const REPOSE_SATURATED_DROP = 8;
+
 /** 耐力 (橋脚用。第 2 弾で使う)。軟弱層はほぼゼロ。 */
 export const GEO_BEARING: Record<number, number> = {
   [Geo.Soil]: 2,

@@ -33,35 +33,37 @@ const EMPTY: EditResult = {
 
 export type EditMode = 'dig' | 'fill';
 
+/**
+ * 形状の固体場。**正 = 内側**。FieldMath の符号規約と同じ。
+ * capsuleSolid / sphereSolid がそのまま渡せる形にしてある。
+ */
+export type SolidFn = (x: number, y: number, z: number) => number;
+
 const volScratch = new Float64Array(GEO_COUNT);
 
 /**
- * スイープしたカプセルで掘る / 盛る。
+ * 任意形状で掘る / 盛る。密度場への書き込みの実体はここ 1 箇所だけ。
  *
  * ブレンド幅 k がこのプロトタイプの肝。単純な max/min で削ると、
  * ブラシの縁と既存地表の交線に鋭い折れ目ができる。その折れ目が格子を
  * 斜めに横切ると、そこだけ階段状に見えてしまう。
  * スムーズ演算で半径 k のフィレットを入れると、斜めのトンネルが
  * 山肌から自然に開口し、ストロークの継ぎ目も消える。
+ *
+ * AABB は呼び出し側が渡す。形状によって「どこまで効くか」が違うので
+ * ここで導けない。**ブレンド幅 k のぶんまで含めて余裕を持たせること。**
+ * 足りないと、範囲の縁で密度が急に古い値に戻り、そこにささくれが出る。
  */
-export function applyCapsule(
+export function applyShape(
   field: VoxelField,
   chunks: ChunkManager,
-  ax: number, ay: number, az: number,
-  bx: number, by: number, bz: number,
-  radius: number,
+  minX: number, minY: number, minZ: number,
+  maxX: number, maxY: number, maxZ: number,
+  solidFn: SolidFn,
   mode: EditMode,
-  k = 0.45,
-  fillGeo: Geo = Geo.Soil,
+  k: number,
+  fillGeo: Geo,
 ): EditResult {
-  const pad = radius + k + 2 * CELL;
-  const minX = Math.min(ax, bx) - pad;
-  const minY = Math.min(ay, by) - pad;
-  const minZ = Math.min(az, bz) - pad;
-  const maxX = Math.max(ax, bx) + pad;
-  const maxY = Math.max(ay, by) + pad;
-  const maxZ = Math.max(az, bz) + pad;
-
   const i0 = Math.max(0, Math.floor(minX / CELL));
   const j0 = Math.max(0, Math.floor(minY / CELL));
   const k0 = Math.max(0, Math.floor(minZ / CELL));
@@ -84,12 +86,12 @@ export function applyCapsule(
       for (let ii = i0; ii <= i1; ii++, idx++) {
         const x = ii * CELL;
 
-        const solid = capsuleSolid(x, y, z, ax, ay, az, bx, by, bz, radius);
+        const solid = solidFn(x, y, z);
         const dOld = density[idx];
 
-        // カプセルの外側でも、そこが新しい壁面に近くなったのなら
+        // 形状の外側でも、そこが新しい壁面に近くなったのなら
         // 距離場としては値を下げなければならない。
-        // 「カプセルから遠いから触らない」で済ませると、掘った直後のセルの
+        // 「形状から遠いから触らない」で済ませると、掘った直後のセルの
         // 隣に古い大きな値が残り、エッジ交点の補間位置がずれて
         // 坑口まわりのメッシュがささくれる。
         let dNew: number;
@@ -135,6 +137,30 @@ export function applyCapsule(
     min: [minX, minY, minZ],
     max: [maxX, maxY, maxZ],
   };
+}
+
+/**
+ * スイープしたカプセルで掘る / 盛る。編集の主力。
+ * ブラシもトンネルの埋め戻しもこれを使う。
+ */
+export function applyCapsule(
+  field: VoxelField,
+  chunks: ChunkManager,
+  ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number,
+  radius: number,
+  mode: EditMode,
+  k = 0.45,
+  fillGeo: Geo = Geo.Soil,
+): EditResult {
+  const pad = radius + k + 2 * CELL;
+  return applyShape(
+    field, chunks,
+    Math.min(ax, bx) - pad, Math.min(ay, by) - pad, Math.min(az, bz) - pad,
+    Math.max(ax, bx) + pad, Math.max(ay, by) + pad, Math.max(az, bz) + pad,
+    (x, y, z) => capsuleSolid(x, y, z, ax, ay, az, bx, by, bz, radius),
+    mode, k, fillGeo,
+  );
 }
 
 /**

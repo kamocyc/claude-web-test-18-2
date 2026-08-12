@@ -20,6 +20,7 @@ import { applyCapsule } from './terrain/Edit';
 import { Economy } from './game/Economy';
 import { Excavator } from './game/Excavator';
 import { BrushCursor } from './game/BrushCursor';
+import { ReposeSystem, slopeInfoAt } from './game/Repose';
 import {
   WORLD_X, WORLD_Z, WATER_TABLE_Y, GEO_NAME_JA, GEO_COLOR, Geo,
 } from './terrain/config';
@@ -39,6 +40,7 @@ const alerts = new Alerts();
 const survey = new SurveySystem();
 const surveyView = new SurveyView();
 const section = new SectionView();
+const repose = new ReposeSystem();
 
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
@@ -128,6 +130,8 @@ let aimSeg: TunnelSegment | null = null;
 let hoverGeo: Geo = Geo.Soil;
 let hoverDepth = 0;
 let lastCost = 0;
+/** 一連の崩落で動いた土量。収まったところで 1 回だけ知らせるために貯める。 */
+let slumpAccum = 0;
 
 function swatch(g: Geo): string {
   const c = GEO_COLOR[g];
@@ -180,6 +184,9 @@ function frame(): void {
           res.min[0], res.min[1], res.min[2],
           res.max[0], res.max[1], res.max[2],
         );
+        // 掘って急になった法面は自重で崩れる。
+        // 種を撒くのは触った所だけ。自然地形は「締まっている」扱いで動かさない。
+        repose.seedFromEdit(res.min, res.max);
         if (tool === 'dig') {
           tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
         }
@@ -234,6 +241,30 @@ function frame(): void {
     }
   }
 
+  // --- 法面の崩落 (安息角) ---
+  // トンネルの更新より前に回す。崩れて土被りが減ったことを同じフレームのうちに
+  // 支保の判定へ渡したいので、順番が逆だと 1 フレーム遅れる。
+  {
+    const slump = repose.update(field, chunks, time.gameDelta);
+    if (slump) {
+      // 崩落も地形変化なので、トンネルの再評価に流す。
+      // 「法面が崩れて土被りが減る → 必要支保が上がる → 劣化が始まる」がこれで繋がる。
+      tunnels.markDirtyByAABB(
+        slump.min[0], slump.min[1], slump.min[2],
+        slump.max[0], slump.max[1], slump.max[2],
+      );
+      section.invalidate();
+      slumpAccum += repose.movedThisTick;
+    }
+    // 一連の崩れが収まったところで 1 回だけ知らせる。
+    // 毎 tick 出すと流れ続けて読めないし、崩れている最中に出しても
+    // 「で、どうなったのか」が分からない。
+    if (slumpAccum > 0 && !repose.active) {
+      alerts.flash(`法面が崩れた — 土砂 ${slumpAccum.toFixed(0)} m³ が法尻に溜まった`);
+      slumpAccum = 0;
+    }
+  }
+
   chunks.update(6);
 
   // --- トンネルの評価・施工・劣化・崩落 ---
@@ -254,6 +285,8 @@ function frame(): void {
   for (const c of tunnels.recentCollapses) {
     tunnelView.burst(c.pos, excavator.radius * 1.3);
     alerts.flash(c.daylight ? '崩落 — 地表が陥没した' : '崩落 — 坑道が埋まった');
+    // 陥没孔の縁は垂直なので、そのままにはならない。寝て広がる。
+    if (c.daylight) repose.seedAround(c.pos, excavator.radius * 2);
   }
   tunnelView.sync(tunnels);
   tunnelView.update(time.realDelta);
@@ -283,6 +316,29 @@ function frame(): void {
       `<div class="row"><span class="k">掘進</span><span class="v">${excavator.headSpeed.toFixed(2)} m/s</span></div>`,
     );
     rows.push(`<div class="row"><span class="k">直近費用</span><span class="v">¥${lastCost.toFixed(0)}</span></div>`);
+  }
+
+  // --- 法面の安息角 ---
+  // 地面が勝手に動く理由が見えないと、ただ理不尽に感じられる。
+  // 「この地質はここまでしか立たない」を掘る前から出しておく。
+  if (hit && (tool === 'dig' || tool === 'fill')) {
+    const si = slopeInfoAt(field, hit.point.x, hit.point.z);
+    if (si) {
+      const over = si.slopeDeg > si.reposeDeg;
+      rows.push(
+        `<div class="row"><span class="k">法面</span><span class="v"` +
+        (over ? ' style="color:#e88a5c"' : '') +
+        `>${si.slopeDeg.toFixed(0)}° / 安息角 ${si.reposeDeg.toFixed(0)}°` +
+        (over ? ' 崩れる' : '') +
+        `</span></div>`,
+      );
+    }
+  }
+  if (repose.active) {
+    rows.push(
+      '<div class="row"><span class="k">崩落中</span>' +
+      `<span class="v" style="color:#e88a5c">${repose.movedTotal.toFixed(0)} m³ 移動</span></div>`,
+    );
   }
 
   // 掘る前の下見。「掘っているのに何も起きない」の正体は、
@@ -397,6 +453,8 @@ declare global {
       time: Time;
       survey: SurveySystem;
       section: SectionView;
+      repose: ReposeSystem;
+      slopeInfoAt: typeof slopeInfoAt;
       THREE: typeof THREE;
       TunnelNetwork: typeof TunnelNetwork;
       raycastTerrain: typeof raycastTerrain;
@@ -413,7 +471,8 @@ declare global {
 
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
-  survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
+  survey, section, repose, slopeInfoAt, THREE, TunnelNetwork,
+  raycastTerrain, overburdenAt,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
@@ -428,7 +487,9 @@ window.__game = {
         a[0], a[1], a[2], b[0], b[1], b[2],
         radius, 'dig', excavator.blend, Geo.Soil,
       );
-      if (res.changed) economy.chargeExcavation(res.volumeByGeo);
+      if (!res.changed) continue;
+      economy.chargeExcavation(res.volumeByGeo);
+      repose.seedFromEdit(res.min, res.max);
     }
     chunks.update(100000);
   },
@@ -444,6 +505,7 @@ window.__game = {
       );
       if (!res.changed) continue;
       economy.chargeExcavation(res.volumeByGeo);
+      repose.seedFromEdit(res.min, res.max);
       tunnels.markDirtyByAABB(
         res.min[0], res.min[1], res.min[2],
         res.max[0], res.max[1], res.max[2],
