@@ -200,7 +200,7 @@ function frame(): void {
       input.rayOrigin(engine.camera, rayOrigin);
       input.rayDirection(engine.camera, rayDir);
       aimSeg = input.inside
-        ? tunnels.nearestToRay(rayOrigin, rayDir, excavator.radius * 1.6)
+        ? tunnels.nearestToRay(rayOrigin, rayDir, excavator.radius * 1.6, supLevel)
         : null;
 
       if (aimSeg && input.primaryDown) {
@@ -332,6 +332,16 @@ function frame(): void {
         rows.push(
           `<div class="row"><span class="k">狙い</span>` +
           `<span class="v" style="color:#9fe8ff">この区間 ±${(excavator.radius * 2.2).toFixed(0)} m</span></div>`,
+        );
+      }
+      const eta = tunnels.installEta(seg);
+      if (eta !== null) {
+        // 施工班は 1 班なので順番待ちがある。押した瞬間に金だけ減って
+        // 見た目が変わらないので、いつ入るのかを必ず出す。
+        rows.push(
+          `<div class="row"><span class="k">施工</span>` +
+          `<span class="v" style="color:#9fe8ff">${supportName(seg.installTarget)} ` +
+          `あと ${Alerts.fmtHours(eta)}</span></div>`,
         );
       }
       rows.push(

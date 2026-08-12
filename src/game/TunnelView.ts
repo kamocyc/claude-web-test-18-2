@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { SEGMENT_LENGTH, type TunnelNetwork, type TunnelSegment } from './Tunnel';
+import { SEGMENT_LENGTH, beamHeight, type TunnelNetwork, type TunnelSegment } from './Tunnel';
 import { supportDef } from './Support';
 
 /**
@@ -14,6 +14,7 @@ import { supportDef } from './Support';
  *   鋼製 (L3)   … 覆工チューブ + 太いリブ。いちばん重装備に見える
  *   支保不足    … 橙→赤に明滅するリング。崩落が近いほど速い
  *                 (色 = 足りているか、形 = 何が入っているか)
+ *   施工待ち    … 危険色を予定の支保色へ寄せた中間色 (手配済みだが未着)
  *   崩落済み    … 暗い赤
  *
  * さらに支保不足の区間からは地表へ警告柱を立てる (深度テストを切ってあるので
@@ -35,6 +36,7 @@ const _q = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
 const _s = new THREE.Vector3();
 const _c = new THREE.Color();
+const _c2 = new THREE.Color();
 const Z = new THREE.Vector3(0, 0, 1);
 const Y = new THREE.Vector3(0, 1, 0);
 
@@ -113,6 +115,20 @@ export class TunnelView {
     return out.setHex(0x5c6b7a); // 岩などで、無支保のまま足りている
   }
 
+  /**
+   * 施工待ち / 施工中の区間は、危険色を予定している支保の色へ寄せる。
+   * 施工班は 1 班なので予約から実際に入るまで時間がかかる。
+   * その間ずっと真っ赤のままだと「押したのに効いていない」に見えるし、
+   * かといって支保色にしてしまうと、まだ崩落しうる事実が隠れる。
+   * 混ぜた色にして「手配済みだが、まだ来ていない」を表す。
+   */
+  private static applyPending(seg: TunnelSegment, out: THREE.Color): THREE.Color {
+    if (seg.collapsed || seg.installTarget <= seg.installed) return out;
+    const target = supportDef(seg.installTarget)?.color;
+    if (target === undefined) return out;
+    return out.lerp(_c2.setHex(target), 0.45);
+  }
+
   sync(net: TunnelNetwork): void {
     if (!net.dirtyVisuals) return;
     net.dirtyVisuals = false;
@@ -130,7 +146,7 @@ export class TunnelView {
       if (!seg.isTunnel && !seg.collapsed) continue;
 
       const atRisk = !seg.collapsed && seg.isTunnel && seg.installed < seg.required;
-      TunnelView.colorFor(seg, _c);
+      TunnelView.applyPending(seg, TunnelView.colorFor(seg, _c));
 
       // --- 覆工チューブ (L2 以上)。地山を覆うので「巻いた」ことが一目で分かる ---
       if (seg.installed >= 2 && !seg.collapsed) {
@@ -162,7 +178,7 @@ export class TunnelView {
 
       // --- 支保不足の区間からは地表まで警告柱を立てる ---
       if (atRisk && nBeam < MAX_BEAMS) {
-        const h = seg.cover + seg.radius * 2 + 4;
+        const h = beamHeight(seg);
         _q.identity();
         _s.set(1, h, 1);
         _m.compose(seg.pos, _q, _s);
@@ -196,7 +212,7 @@ export class TunnelView {
       if (!seg) continue;
       const speed = 2 + (1 - Math.max(0, seg.integrity)) * 10;
       const k = 0.55 + 0.45 * Math.sin(this.t * speed);
-      TunnelView.colorFor(seg, _c);
+      TunnelView.applyPending(seg, TunnelView.colorFor(seg, _c));
       this.rings.setColorAt(i, _c.multiplyScalar(k));
     }
     if (this.riskRings.length > 0 && this.rings.instanceColor) {
@@ -208,8 +224,8 @@ export class TunnelView {
       if (!seg) continue;
       const speed = 2 + (1 - Math.max(0, seg.integrity)) * 10;
       const k = 0.5 + 0.5 * Math.sin(this.t * speed);
-      _c.setRGB(1, 0.05 + 0.30 * seg.integrity, 0.05 + 0.10 * seg.integrity)
-        .multiplyScalar(0.55 + 0.45 * k);
+      _c.setRGB(1, 0.05 + 0.30 * seg.integrity, 0.05 + 0.10 * seg.integrity);
+      TunnelView.applyPending(seg, _c).multiplyScalar(0.55 + 0.45 * k);
       this.beams.setColorAt(i, _c);
     }
     if (this.beams.instanceColor) this.beams.instanceColor.needsUpdate = true;

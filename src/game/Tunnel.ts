@@ -91,6 +91,50 @@ const _v = new THREE.Vector3();
 const _p = new THREE.Vector3();
 const _pp = new THREE.Vector3();
 
+/**
+ * 支保不足の区間から地表へ伸ばす警告柱の高さ [m]。
+ * 描画 (TunnelView) と当たり判定 (nearestToRay) で必ず同じ値を使うこと。
+ * ずれると「見えている柱を狙っても取れない」が起きる。
+ */
+export function beamHeight(seg: TunnelSegment): number {
+  return seg.cover + seg.radius * 2 + 4;
+}
+
+/**
+ * レイと「A から真上へ h 伸びる線分」との最短距離、およびレイ上の位置。
+ *
+ * 区間の中心点との距離で判定すると、警告柱は根元しか押せない
+ * (拾い半径ぶんの高さまでしか届かない)。柱を線分として扱えば、
+ * 見えている柱のどこを狙っても、その下の区間が取れる。
+ */
+function rayToVertical(
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+  ax: number, ay: number, az: number,
+  h: number,
+): { dist: number; t: number } {
+  // レイ P(t) = O + t*D (|D| = 1, t >= 0)、線分 Q(s) = A + s*(0,1,0) (0 <= s <= h)
+  const wx = ox - ax;
+  const wy = oy - ay;
+  const wz = oz - az;
+  const b = dy;                          // D·U
+  const d = dx * wx + dy * wy + dz * wz; // D·w
+  const e = wy;                          // U·w
+  const denom = 1 - b * b;
+
+  let s = denom > 1e-6 ? (e - b * d) / denom : 0;
+  if (s < 0) s = 0;
+  else if (s > h) s = h;
+
+  let t = s * b - d;
+  if (t < 0) t = 0;
+
+  const px = ox + dx * t - (ax);
+  const py = oy + dy * t - (ay + s);
+  const pz = oz + dz * t - (az);
+  return { dist: Math.sqrt(px * px + py * py + pz * pz), t };
+}
+
 /** dir に垂直な正規直交基底を作る。 */
 function basis(dir: THREE.Vector3, u: THREE.Vector3, v: THREE.Vector3): void {
   const a = Math.abs(dir.y) < 0.9 ? _p.set(0, 1, 0) : _p.set(1, 0, 0);
@@ -346,6 +390,25 @@ export class TunnelNetwork {
   }
 
   /**
+   * その区間の支保が実際に入るまでの見込み時間 [ゲーム内時間]。
+   * 予約していなければ null。
+   *
+   * 施工班は 1 班しかいないので、列の前に積まれた区間の施工時間を全部足す。
+   * 押した瞬間に金だけ減って見た目が変わらないので、
+   * これを出さないと「効いていないのでは」と思われる。
+   */
+  installEta(seg: TunnelSegment): number | null {
+    const idx = this.installQueue.indexOf(seg.id);
+    if (idx < 0) return null;
+    let h = 0;
+    for (let i = 0; i <= idx; i++) {
+      const s = this.byId.get(this.installQueue[i]);
+      if (s) h += Math.max(0, s.installRemaining);
+    }
+    return h;
+  }
+
+  /**
    * 毎フレーム呼ぶ。再評価 → 施工 → 劣化 → 崩落 の順。
    * @param gameDelta ゲーム内時間の経過 [時]
    */
@@ -523,24 +586,43 @@ export class TunnelNetwork {
     origin: THREE.Vector3,
     dir: THREE.Vector3,
     maxPerp: number,
+    wantLevel = 0,
   ): TunnelSegment | null {
-    let best: TunnelSegment | null = null;
-    let bestT = Infinity;
-    const maxPerp2 = maxPerp * maxPerp;
+    // 「まだその支保を入れられる区間」と「そうでない区間」を別々に持つ。
+    // 手前だけを見ると、既に手当て済みの区間が奥の未処置の区間を覆い隠して
+    // いつまでも奥に届かない。まだ入れられるものがあればそちらを優先する。
+    let bestOpen: TunnelSegment | null = null;
+    let bestOpenT = Infinity;
+    let bestAny: TunnelSegment | null = null;
+    let bestAnyT = Infinity;
+
     for (const s of this.segments) {
       if (s.collapsed || !s.isTunnel) continue;
-      _pp.subVectors(s.pos, origin);
-      const t = _pp.dot(dir);
-      if (t <= 0) continue; // 背後
-      const perp2 = _pp.lengthSq() - t * t;
-      if (perp2 > maxPerp2) continue;
-      // レイに乗っているもののうち、いちばん手前を採る
-      if (t < bestT) {
-        bestT = t;
-        best = s;
+
+      // 支保不足の区間は警告柱ぶんの高さまで当たり判定を伸ばす
+      const h = s.installed < s.required ? beamHeight(s) : 0;
+      const r = rayToVertical(
+        origin.x, origin.y, origin.z,
+        dir.x, dir.y, dir.z,
+        s.pos.x, s.pos.y, s.pos.z,
+        h,
+      );
+      if (r.dist > maxPerp || r.t <= 0) continue;
+
+      if (r.t < bestAnyT) {
+        bestAnyT = r.t;
+        bestAny = s;
+      }
+      const open = wantLevel > 0
+        && s.required > 0
+        && s.installed < wantLevel
+        && s.installTarget < wantLevel;
+      if (open && r.t < bestOpenT) {
+        bestOpenT = r.t;
+        bestOpen = s;
       }
     }
-    return best;
+    return bestOpen ?? bestAny;
   }
 
   /** カーソル位置に最も近いセグメント。 */
