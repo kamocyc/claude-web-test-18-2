@@ -9,6 +9,8 @@ import { Alerts } from './ui/Alerts';
 import { TunnelNetwork } from './game/Tunnel';
 import { TunnelView } from './game/TunnelView';
 import { supportName } from './game/Support';
+import { SurveySystem, SurveyView, BORING_COST_PER_M, BORING_DEPTH } from './game/Survey';
+import { SectionView } from './ui/SectionView';
 import { VoxelField } from './terrain/VoxelField';
 import { generate } from './terrain/Generator';
 import { ChunkManager } from './terrain/ChunkManager';
@@ -34,6 +36,9 @@ const excavator = new Excavator();
 const tunnels = new TunnelNetwork();
 const tunnelView = new TunnelView();
 const alerts = new Alerts();
+const survey = new SurveySystem();
+const surveyView = new SurveyView();
+const section = new SectionView();
 
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
@@ -82,6 +87,7 @@ const cursor = new BrushCursor();
 cursor.setRadius(excavator.radius);
 engine.scene.add(cursor.object);
 engine.scene.add(tunnelView.object);
+engine.scene.add(surveyView.object);
 
 // --- カメラ初期位置: 尾根と谷が両方入る俯瞰 ---
 rig.lookAt(
@@ -174,6 +180,8 @@ function frame(): void {
         if (tool === 'dig') {
           tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
         }
+        // 掘れば新しい壁面が露出する = そこの地質は分かるようになる
+        section.invalidate();
       }
     }
   } else {
@@ -191,6 +199,19 @@ function frame(): void {
         }
       }
     }
+
+    // --- ボーリング調査 ---
+    if (tool === 'boring' && input.primaryPressed && hit) {
+      const b = survey.start(field, hit.point.x, hit.point.z, economy);
+      if (!b) alerts.flash('調査を開始できない (資金不足)');
+      else section.invalidate();
+    }
+
+    // --- 断面線 ---
+    if (tool === 'section') {
+      if (input.primaryPressed && hit) section.setStart(hit.point);
+      else if (input.primaryDown && hit) section.setEnd(hit.point);
+    }
   }
 
   chunks.update(6);
@@ -204,6 +225,13 @@ function frame(): void {
   tunnelView.sync(tunnels);
   tunnelView.update(time.realDelta);
   alerts.update(tunnels, time.realDelta);
+
+  // --- 調査 ---
+  survey.update(field, time.gameDelta);
+  // sync() が dirty を落とすので、その前に拾っておく
+  if (survey.dirty) section.invalidate();
+  surveyView.sync(survey);
+  section.update(field, survey, performance.now());
 
   // --- HUD ---
   const rows: string[] = [];
@@ -246,6 +274,18 @@ function frame(): void {
     }
   }
 
+  if (tool === 'boring') {
+    const drilling = survey.borings.filter((b) => !b.done).length;
+    rows.push(
+      `<div class="row"><span class="k">調査費</span><span class="v">` +
+      `¥${(BORING_DEPTH * BORING_COST_PER_M).toLocaleString()} / 本</span></div>`,
+    );
+    rows.push(
+      `<div class="row"><span class="k">孔数</span><span class="v">${survey.borings.length}` +
+      (drilling > 0 ? ` (掘進中 ${drilling})` : '') + '</span></div>',
+    );
+  }
+
   rows.push(`<div class="row"><span class="k">ブラシ</span><span class="v">R ${excavator.radius.toFixed(1)} m</span></div>`);
   hud.update(time, chunks.stats, rows.join(''));
 
@@ -267,6 +307,9 @@ declare global {
       toolbar: Toolbar;
       tunnels: TunnelNetwork;
       time: Time;
+      survey: SurveySystem;
+      section: SectionView;
+      THREE: typeof THREE;
       ready: boolean;
       view(from: [number, number, number], at: [number, number, number]): void;
       /** テスト用: ワールド座標の折れ線に沿って一気に掘る */
@@ -279,6 +322,7 @@ declare global {
 
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
+  survey, section, THREE,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));

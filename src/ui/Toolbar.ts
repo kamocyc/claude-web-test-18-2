@@ -1,4 +1,4 @@
-export type ToolId = 'look' | 'dig' | 'fill' | 'sup1' | 'sup2' | 'sup3';
+export type ToolId = 'look' | 'dig' | 'fill' | 'sup1' | 'sup2' | 'sup3' | 'boring' | 'section';
 
 interface ToolDef {
   id: ToolId;
@@ -16,6 +16,8 @@ const TOOLS: ToolDef[] = [
   { id: 'sup1', label: '木枠', key: 'A', hint: 'トンネルをなぞって木枠 (L1) を設置', support: 1 },
   { id: 'sup2', label: '覆工', key: 'S', hint: 'トンネルをなぞってコンクリート覆工 (L2) を設置', support: 2 },
   { id: 'sup3', label: '鋼製', key: 'D', hint: 'トンネルをなぞって鋼製支保+排水 (L3) を設置', support: 3 },
+  { id: 'boring', label: '調査', key: 'Z', hint: 'クリックでボーリング調査。周囲 9 m の地質が分かる' },
+  { id: 'section', label: '断面', key: 'X', hint: '地表をドラッグして断面線を引く。裏付けの無い地質は伏せられる' },
 ];
 
 /** そのツールが設置する支保レベル。支保ツールでなければ 0。 */
