@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as THREE from 'three';
-import { TunnelNetwork, type TunnelSegment } from './Tunnel';
+import { TunnelNetwork, SEGMENT_LENGTH, type TunnelSegment } from './Tunnel';
 import { VoxelField } from '../terrain/VoxelField';
 import { CELL, NX, NY, NZ, Geo, WATER_TABLE_Y } from '../terrain/config';
 
@@ -175,6 +175,39 @@ describe('必要支保レベル', () => {
     // 足りていれば崩落しない
     s.installed = 3;
     expect(TunnelNetwork.hoursToFailure(s)).toBe(Infinity);
+  });
+
+  it('崩落した区間は掘り返すと片付き、新しい区間に置き換わる', () => {
+    // 崩落区間は再評価されないので、放っておくと再開通した坑道の中に
+    // 崩落済みマーカーが残り続け、掘り直すたびに区間が増えていく。
+    const n = new TunnelNetwork();
+    const dir = new THREE.Vector3(1, 0, 0);
+    const head = new THREE.Vector3(X_WEAK, DEEP_Y, 60);
+
+    n.recordBore(field, head, dir, R);
+    expect(n.segments).toHaveLength(1);
+
+    // 崩落させる
+    const s0 = n.segments[0];
+    s0.collapsed = true;
+    s0.integrity = 0;
+
+    // 同じ所を掘り直す
+    n.endBore();
+    n.recordBore(field, head, dir, R);
+
+    expect(n.segments).toHaveLength(1);
+    expect(n.segments[0].collapsed).toBe(false);
+    expect(n.segments[0].id).not.toBe(s0.id);
+
+    // 離れた所の崩落マーカーは残る
+    const far = new THREE.Vector3(X_WEAK, DEEP_Y, 60 + SEGMENT_LENGTH * 4);
+    n.endBore();
+    n.recordBore(field, far, dir, R);
+    n.segments[n.segments.length - 1].collapsed = true;
+    n.endBore();
+    n.recordBore(field, head.clone().add(new THREE.Vector3(0, 0, 0.1)), dir, R);
+    expect(n.segments.filter((s) => s.collapsed)).toHaveLength(1);
   });
 
   it('必要 0 の区間には支保を予約できない (金と施工班の無駄)', () => {

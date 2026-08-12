@@ -142,6 +142,23 @@ export class TunnelNetwork {
 
   /** 掘進中に呼ぶ。2 m 進むごとにセグメントを 1 本置く。 */
   recordBore(field: VoxelField, head: THREE.Vector3, dir: THREE.Vector3, radius: number): void {
+    // ここが掘り返されたなら、古い崩落マーカーはもう意味がない。
+    // 残したままにすると、再開通した坑道の中に崩落済みの暗いリングが浮き、
+    // 掘り直すたびに区間が増え続ける (崩落区間は再評価されないので自然には消えない)。
+    //
+    // 下の早期 return より前に置くこと。地表まで抜けた崩落 (陥没) の跡は
+    // 土被りが無くなっているので、後ろに置くと cover 判定で弾かれて
+    // いつまでも片付かない。掘り返した事実は土被りの有無とは無関係。
+    for (let i = this.segments.length - 1; i >= 0; i--) {
+      const old = this.segments[i];
+      if (!old.collapsed) continue;
+      if (old.pos.distanceTo(head) > SEGMENT_LENGTH * 1.2) continue;
+      this.segments.splice(i, 1);
+      this.byId.delete(old.id);
+      this.index.remove(old.id);
+      this.dirtyVisuals = true;
+    }
+
     if (this.segments.length >= MAX_SEGMENTS) return;
     if (this.lastRecord && this.lastRecord.distanceTo(head) < SEGMENT_LENGTH) return;
 
