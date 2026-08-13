@@ -19,17 +19,27 @@ import type { ChunkManager } from '../terrain/ChunkManager';
  * このプロジェクトでいちばん壊してはいけない要件なので、この方式は採らない。
  *
  * ---- 代わりに何をしているか ----
- * 崩落を「安息角の平面での滑らかな CSG 切り取り」として表す。
+ * 「影響球の中の地表を、安息角の平面そのものに均す」を繰り返す。
  *
  *   P   = いちばん急な地表点 (真下向きレイ + PROBE の走査で探す)
  *   g   = 下り方向 = 法線の水平成分 (外向き法線は下り側へ倒れる)
- *   Q   = P から g へ 1 歩 (STEP) 進んだ先の地表点
  *   n_r = ŷ cos θr + g sin θr             // 安息角の面の法線
- *   削る形 = min( (p-P)·n_r , R - |p-P| )  // 安息角面より上 かつ 影響球の中
- *   積む形 = 側面が安息角の円錐 (Q のさらに下流)
+ *   削る = smin( (p-P)·n_r , R - |p-P| )   // 面より上 かつ 球の中 → dig
+ *   埋め = smin(-(p-P)·n_r , R - |p-P| )   // 面より下 かつ 球の中 → fill
+ *
+ * **削りと埋めを同じ球で対にするのが肝。** その球の中の地表は安息角の面
+ * そのものになるので、出っ張りが生まれる余地が無い。土が下流へ動くという
+ * 性質も保たれる (球の中で上流側が削れて下流側が埋まるため)。
+ *
+ * 埋めるほうを「法尻に山を積む」形にした版は両方とも駄目だった。
+ *  - 球を置く: 地面と交わる所の接線が立ち、置いた端からまた崩落対象になって
+ *    土が永久に歩き回る (3600 m^3 動かしても収束しない)
+ *  - 安息角の円錐を置く: 収束はするが、山が周りより高い所に取り残されると
+ *    「傘の広い上半分 + 細い下半分」が露出して **キノコ**が並ぶ
+ * どちらも「点に山を積む」ことが根本原因で、面で均せば両方消える。
  *
  * 使う演算子はプレイヤーの掘削とまったく同じ applyShape なので、
- * 滑らかさは既に実証済みのものがそのまま出る。切る平面の向きは場の勾配から
+ * 滑らかさは既に実証済みのものがそのまま出る。面の向きは場の勾配から
  * 来る連続量で、格子とは無関係。ここが CA との決定的な違い。
  *
  * ---- 角度が収束する理由 ----
@@ -50,8 +60,8 @@ import type { ChunkManager } from '../terrain/ChunkManager';
  *  - 種は編集した AABB からしか撒かない (自然地形は「締まっている」)
  *  - 伝播は hops で数え、MAX_HOPS を超えたら撒かない (= 崩れるのは 15 m 上まで)
  *  - 1 tick に動かせる体積に予算をつける (ゲーム内時間に比例)
- *  - 積む形を安息角の円錐にする (球を置くと置いた端から急な面ができて止まらない)
- *  - 削った量 = 積んだ量 + 負債 を恒等式として保つ (土が湧くと永久に崩れ続ける)
+ *  - 削りと埋めを対にする (単独の山を置かないので新しい急面が生まれない)
+ *  - 削った量 = 埋めた量 + 負債 を恒等式として保つ (土が湧くと永久に崩れ続ける)
  */
 
 /** 影響球の半径 [m]。CELL の 4 倍以上にすること (格子が見えないための最低条件)。 */
@@ -97,19 +107,8 @@ const BLEND = 0.7;
 /** 影響球の縁を丸める幅 [m]。ここを 0 にすると地形が低ポリゴンに見える。 */
 const RIM_BLEND = 0.6;
 
-/** 堆積の上下の円錐をつなぐ丸め幅 [m]。 */
-const CONE_BLEND = 0.5;
-
-/** 堆積させる円錐の最小の高さ [m]。これに満たない負債は貯めておく。 */
-const MIN_DEPOSIT_H = 0.35;
-/** 堆積の下側をすぼめる比。大きいほど地中に食い込む量が減る。 */
-const UNDER_TAPER = 2.0;
-
-/** 側面が安息角の円錐の体積。底面半径は h/tan。 */
-function coneVolume(h: number, tanR: number): number {
-  const rb = h / tanR;
-  return (Math.PI * rb * rb * h) / 3;
-}
+/** 体積の帳尻合わせで安息角面を上下させられる幅 [m]。詳細は使用箇所。 */
+const MAX_LIFT = 0.5;
 
 /** これ未満しか削れなければ「動かせなかった」とみなす [m^3]。 */
 const MIN_CUT_VOL = 0.02;
@@ -428,9 +427,7 @@ export class ReposeSystem {
     // 「一番急な所」「一番低い所」のような採り方になり、波打った地表の局所的な
     // 凹凸を拾って安息角を通り越して削り続けてしまう (どちらも試して確認した)。
     if (!surfaceAt(field, px + gx * STEP, pz + gz * STEP, _p)) return null;
-    let qx = _p.x;
     let qy = _p.y;
-    let qz = _p.z;
     let bestDist = STEP;
 
     // ただし狭い切土だけは例外。1 歩で溝を跨いで **向こう側の法面** に着地すると
@@ -438,9 +435,7 @@ export class ReposeSystem {
     // 幅の狭い掘り方をするといつまでも垂直の壁が残る。
     // 跨いだと分かったときだけ、半歩で測り直す。
     if (qy >= py && surfaceAt(field, px + gx * STEP * 0.5, pz + gz * STEP * 0.5, _p)) {
-      qx = _p.x;
       qy = _p.y;
-      qz = _p.z;
       bestDist = STEP * 0.5;
     }
     const bestGrad = (py - qy) / bestDist;
@@ -472,23 +467,38 @@ export class ReposeSystem {
     // 結果、安息角を通り越して寝すぎる (土で 34 度の狙いが 26 度になっていた)。
     // P を通せば「P から上を安息角で寝かせる」だけになり、削りすぎない。
     // わずかに下げてあるのは、階段状に取り残さず確実に食い込ませるため。
-    const ay = py - PIVOT_DROP;
+    //
+    // lift は体積の帳尻合わせ。削りが勝って土が余っていれば面を少し持ち上げ、
+    // 次の操作で埋めが増えるようにする。面の高さ 1 本で収支を操作できる。
+    const lift = clamp(this.debt / (Math.PI * R * R), -MAX_LIFT, MAX_LIFT);
+    const ay = py - PIVOT_DROP + lift;
 
+    const lo = -R - BLEND - 2 * CELL;
+    const hi = R + BLEND + 2 * CELL;
+    /** 安息角面より上か (正 = 上)。 */
+    const above = (x: number, y: number, z: number) =>
+      (x - px) * nrx + (y - ay) * nry + (z - pz) * nrz;
+    /** 影響球の中か (正 = 中)。 */
+    const ball = (x: number, y: number, z: number) =>
+      R - Math.hypot(x - px, y - py, z - pz);
+
+    // 面より上を削り、**同じ球の中で面より下を埋める**。
+    //
+    // 埋めるほうを別の場所に山として置いてはいけない。円錐にすると、置いた山が
+    // 周りの地面より高い所に取り残されたときに「傘の広い上半分 + 細い下半分」が
+    // そのまま露出して **キノコ**に見える。球にすると地面と交わる所の接線が立って
+    // 永久に崩れ続ける。どちらも「点に山を積む」ことが根本の原因。
+    //
+    // 同じ球の中で上を削って下を埋めれば、その球の中の地表は安息角の面そのものに
+    // なる。出っ張りが生まれる余地が無く、隣の球とも同じ向きの面でつながる。
+    // 土が下流へ動くという性質も保たれる (球の中で上流側を削り下流側を埋めるので)。
     const cut = applyShape(
       field, chunks,
-      px - R - BLEND - 2 * CELL, py - R - BLEND - 2 * CELL, pz - R - BLEND - 2 * CELL,
-      px + R + BLEND + 2 * CELL, py + R + BLEND + 2 * CELL, pz + R + BLEND + 2 * CELL,
-      (x, y, z) => {
-        // 安息角面より上か (正 = 上)
-        const above = (x - px) * nrx + (y - ay) * nry + (z - pz) * nrz;
-        // 影響球の中か (正 = 中)
-        const ball = R - Math.hypot(x - px, y - py, z - pz);
-        // 積集合 (正 = 内側なので min)。**素の min にしないこと。**
-        // 素で取ると球の縁に沿って鋭い折れ目ができ、隣り合う崩落の面どうしが
-        // 稜線で交わって、地形が低ポリゴンの割れた岩のように見える。
-        // スムーズにすると縁が丸まり、崩れた土の面らしい連続した形になる。
-        return smin(above, ball, RIM_BLEND);
-      },
+      px + lo, py + lo, pz + lo, px + hi, py + hi, pz + hi,
+      // 積集合 (正 = 内側なので min)。**素の min にしないこと。**
+      // 素で取ると球の縁に沿って鋭い折れ目ができ、隣り合う崩落の面どうしが
+      // 稜線で交わって、地形が低ポリゴンの割れた岩のように見える。
+      (x, y, z) => smin(above(x, y, z), ball(x, y, z), RIM_BLEND),
       'dig', BLEND, Geo.Soil,
     );
 
@@ -512,9 +522,22 @@ export class ReposeSystem {
     this.debt += cut.totalVolume;
     let edit = cut;
 
-    // --- 5) 法尻に積む ---
-    const dep = this.deposit(field, chunks, qx, qz, gx, gz, fallenGeo, thetaR);
-    if (dep) edit = mergeEdits(edit, dep);
+    // --- 5) 同じ球の中で、面より下を埋める ---
+    const fill = applyShape(
+      field, chunks,
+      px + lo, py + lo, pz + lo, px + hi, py + hi, pz + hi,
+      (x, y, z) => smin(-above(x, y, z), ball(x, y, z), RIM_BLEND),
+      'fill', BLEND, fallenGeo,
+    );
+    if (fill.changed) {
+      const added = -fill.totalVolume; // fill なので totalVolume は負
+      // 負債は負にもする。多く埋めてしまっても、その分だけ次から面が下がって
+      // 帳尻が合う。0 で止めると差額がそのまま「湧いた土」になる。
+      // これで 削った量 = 埋めた量 + 負債 が恒等式として常に成り立つ。
+      this.debt -= added;
+      this.depositedTotal += added;
+      edit = mergeEdits(edit, fill);
+    }
 
     // ここで「崩れた跡も緩んだ地山だ」として markDisturbed してはいけない。
     // 崩落が自分の進む先を次々と緩い扱いにしていくので、地滑りが自分で道を
@@ -534,83 +557,4 @@ export class ReposeSystem {
     return { edit, moved: cut.totalVolume };
   }
 
-  /**
-   * 溜まっている土砂を法尻に置く。
-   *
-   * **置く形は安息角の円錐にすること。** 球を地面にぽんと置くと、地面と交わる
-   * ところの接線が立ってしまい、置いた瞬間にそこが「急すぎる法面」になる。
-   * すると削って別の場所に置く → そこがまた急、で土が延々と歩き回って止まらない。
-   * 実際そうなっていた (3600 m^3 動かしても収束しなかった)。
-   * 円錐なら側面がはじめから安息角ちょうどなので、置いた時点で安定している。
-   * 砂を落とすと円錐になる、という当たり前の形がそのまま答えになっている。
-   *
-   * 大きさは **円錐がまるごと地上に出た場合でも負債を超えない**ように採る。
-   * 多く置くのは土が湧くのと同じで、これも止まらなくなる原因になる。
-   * 少なめに置いて残りを次の tick に回すのは安全側。
-   */
-  private deposit(
-    field: VoxelField,
-    chunks: ChunkManager,
-    qx: number, qz: number,
-    gx: number, gz: number,
-    geo: Geo,
-    thetaR: number,
-  ): EditResult | null {
-    // 最小の山でも負債を超えてしまう量しか無いなら、貯めて次の機会に置く
-    const tanR = Math.max(0.15, Math.tan(thetaR));
-    if (this.debt < coneVolume(MIN_DEPOSIT_H, tanR)) return null;
-
-    // 支点よりさらに一歩下流に置く。支点の真上に置くと法面がまた急になる。
-    if (!surfaceAt(field, qx + gx * STEP * 0.7, qz + gz * STEP * 0.7, _p)) return null;
-
-    // V = (1/3) pi (h/tan)^2 h  を h について解く。
-    // 安息角が寝ているほど裾が広がるので、底面半径のほうでも頭打ちにする。
-    // そうしないと軟弱層・水位下 (18 度) で半径 8 m の薄い円盤になり、
-    // 1 回の堆積の編集範囲が無駄に太る。
-    const hMax = Math.min(R * 1.2, R * 2.5 * tanR);
-    const h = clamp(
-      Math.cbrt((3 * this.debt * tanR * tanR) / Math.PI),
-      MIN_DEPOSIT_H,
-      Math.max(MIN_DEPOSIT_H, hMax),
-    );
-    const rb = h / tanR;
-
-    const cx = _p.x;
-    const cz = _p.z;
-    // 少しめり込ませて置く。地表にちょこんと乗せると縁が浮いて見える。
-    const baseY = _p.y - 0.25;
-
-    const pad = BLEND + 2 * CELL;
-    const res = applyShape(
-      field, chunks,
-      cx - rb - pad, baseY - h / UNDER_TAPER - pad, cz - rb - pad,
-      cx + rb + pad, baseY + h + pad, cz + rb + pad,
-      (x, y, z) => {
-        const dh = Math.hypot(x - cx, z - cz);
-        const dy = y - baseY;
-        // 上は安息角ちょうどの円錐、下は速めにすぼめた円錐 (正 = 内側)。
-        //
-        // 下側をすぼめるのがミソ。円柱で切ると側面が垂直になり、まわりの地面が
-        // 低い所ではその垂直面がむき出しになって、置いた瞬間にまた崩落対象になる。
-        // 上下とも斜面で閉じておけば、どこがむき出しになっても急な面が出ない。
-        //
-        // つなぎ目 (dy = 0) はスムーズに取る。素の min だと山の腹に
-        // 一周ぐるりと折れ目が出て、置いた土砂が円盤を伏せたように見える。
-        const base = h - dh * tanR;
-        return smin(base - dy, base + dy * UNDER_TAPER, CONE_BLEND);
-      },
-      'fill', BLEND, geo,
-    );
-
-    if (!res.changed) return null;
-    const added = -res.totalVolume; // fill なので totalVolume は負
-    if (added <= 0) return res;
-
-    // 負債は負にもする。狙いより多く積んでしまっても、その分だけ次の堆積が
-    // 遅れて帳尻が合う。0 で止めると差額がそのまま「湧いた土」になる。
-    // これで 削った量 = 積んだ量 + 負債 が恒等式として常に成り立つ。
-    this.debt -= added;
-    this.depositedTotal += added;
-    return res;
-  }
 }
