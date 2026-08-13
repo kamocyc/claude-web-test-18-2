@@ -102,6 +102,38 @@ export function beamHeight(seg: TunnelSegment): number {
 }
 
 /**
+ * 天端 (中心 + 半径) から真上へ測った土被り [m]。
+ *
+ * `overburdenAt` の呼び出し規約 (起点は天端 / maxVoid は半径) をここに閉じる。
+ * 掘る前の下見・掘進中の登録・あとからの再評価・道路の線形が全部ここを通るので、
+ * 「下見ではトンネルと言っていたのに掘ったらならない」が原理的に起きない。
+ */
+export function coverAtCrown(
+  field: VoxelField,
+  x: number, y: number, z: number,
+  radius: number,
+): number {
+  return overburdenAt(field, x, y + radius, z, radius);
+}
+
+/**
+ * その土被りで坑道が「トンネル」として成立するか。
+ *
+ * **これがトンネルであることの唯一の定義。** 掘進中の登録 (`recordBore`)、
+ * 再評価 (`evaluate`)、道路の線形の区間分類 (`Alignment.classify`) が
+ * すべてこの 1 つの述語を呼ぶ。
+ *
+ * 以前は線形の側が「計画高と地盤高の差 > 2.85 R」という**別の量**で
+ * 分類していて、掘ったのに登録されない帯ができた (実測: 22 m 掘って区間 0 本)。
+ * そうなるとその帯は支保も崩落も掛からず、しかも回廊の切盛は
+ * 「トンネル区間だから」と飛ばすので切土でもない、どちらの系にも属さない
+ * 大穴になる。**判定を増やさないこと。**
+ */
+export function isTunnelCover(cover: number, radius: number): boolean {
+  return cover >= radius * COVER_TUNNEL_MIN;
+}
+
+/**
  * レイと「A から真上へ h 伸びる線分」との最短距離、およびレイ上の位置。
  *
  * 区間の中心点との距離で判定すると、警告柱は根元しか押せない
@@ -215,8 +247,8 @@ export class TunnelNetwork {
 
     // 地表付近の整地までセグメントにすると邪魔なので、
     // 記録の時点で土被りが無いものは捨てる。
-    const cover = overburdenAt(field, head.x, head.y + radius, head.z, radius);
-    if (cover < radius * COVER_TUNNEL_MIN) {
+    const cover = coverAtCrown(field, head.x, head.y, head.z, radius);
+    if (!isTunnelCover(cover, radius)) {
       this.lastRecord = head.clone();
       return;
     }
@@ -268,10 +300,8 @@ export class TunnelNetwork {
     if (seg.collapsed) return;
 
     // --- 土被り。天端から測る (残った空洞は overburdenAt が抜けてくれる) ---
-    seg.cover = overburdenAt(
-      field, seg.pos.x, seg.pos.y + seg.radius, seg.pos.z, seg.radius,
-    );
-    seg.isTunnel = seg.cover >= seg.radius * COVER_TUNNEL_MIN;
+    seg.cover = coverAtCrown(field, seg.pos.x, seg.pos.y, seg.pos.z, seg.radius);
+    seg.isTunnel = isTunnelCover(seg.cover, seg.radius);
     seg.belowWater = seg.pos.y < WATER_TABLE_Y;
 
     if (!seg.isTunnel) {

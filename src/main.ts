@@ -17,7 +17,7 @@ import {
   buildAlignment, lengthByKind, ROAD_STANDARDS, RoadKind, ROAD_KIND_NAME,
   type Alignment, type RoadStandard, type Vec2,
 } from './game/Alignment';
-import { planRoad, RoadNetwork, groundHeightAt, type RoadPlan } from './game/Roadworks';
+import { planRoad, RoadNetwork, groundHeightAt, terrainProbe, type RoadPlan } from './game/Roadworks';
 import { BridgeNetwork } from './game/Bridge';
 import { RoadView, roadKindCss, describeBridge } from './game/RoadView';
 import { SectionView } from './ui/SectionView';
@@ -142,10 +142,18 @@ const control: Vec2[] = [];
 let roadStd: RoadStandard = ROAD_STANDARDS[0];
 let alignment: Alignment | null = null;
 let roadPlan: RoadPlan | null = null;
-/** 制御点か規格が変わったら解き直す。毎フレームやるには重い (実測 10-20 ms)。 */
+/**
+ * 制御点か規格が変わったら解き直す。毎フレームやるには重い
+ * (実測 49-91 ms。ほとんどは回廊の展開で、線形そのものは 10 ms 前後)。
+ */
 let alignDirty = false;
 
 const groundAt = (x: number, z: number): number => groundHeightAt(heightIndex, x, z);
+/**
+ * 線形の分類に渡す地形の読み口。
+ * トンネルかどうかは掘る側とまったく同じ述語で答える (`Tunnel.isTunnelCover`)。
+ */
+const probe = terrainProbe(field, heightIndex);
 
 /**
  * **既知の情報だけ**で地質を読むサンプラ。橋脚の支持力の見積りに使う。
@@ -169,7 +177,7 @@ function knownGeoAt(x: number, y: number, z: number): Geo {
 const trueGeoAt = (x: number, y: number, z: number): Geo => field.materialAt(x, y, z);
 
 function replanRoad(): void {
-  alignment = control.length >= 2 ? buildAlignment(control, groundAt, roadStd) : null;
+  alignment = control.length >= 2 ? buildAlignment(control, probe, roadStd) : null;
   roadPlan = alignment
     ? planRoad(field, heightIndex, alignment, economy, knownGeoAt)
     : null;

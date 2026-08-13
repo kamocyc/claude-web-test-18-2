@@ -117,37 +117,52 @@ export const ROAD_KIND_NAME: Record<number, string> = {
 const FILL_MAX = 9;
 
 /**
- * この深さを超える切土は**トンネルにする** [m] の下限。
- * 盛土より深めに取ってあるのは、切土のほうが (掘った土が盛土に回るので)
- * 経済的に有利なため。
- */
-const CUT_MAX_MIN = 12;
-
-/**
- * トンネルにする切土深さ / トンネル断面の半径。
- *
- * ここを固定値 (12 m) にしていると、**掘ったのにトンネルとして登録されない**
- * 区間ができる。坑道の天端は路面から 1.25 R 上にあり
- * (`Roadworks.BORE_CENTER_RATIO`)、トンネル成立にはさらに 1.2 R の土被りが
- * 要る (`Tunnel.COVER_TUNNEL_MIN`) ので、合わせて 2.45 R 必要。
- * 幅 9 m の道路なら R = 6.1 m なので 15.0 m で、12 m では足りない。
- * 実測では 22 m のトンネル区間を掘って**区間が 0 本**、つまり支保も崩落も
- * 掛からない大穴が地表近くに開いた。
- *
- * 余裕を見て 2.85 倍 (山岳 13.8 m / 標準 17.4 m)。これを下回る深さは、
- * 掘っても土被りが付かない = ただの深い切土なので、切土と呼ぶのが正しい。
- * **この値を下げて「トンネルが出やすい」ようにしてはいけない。**
- * 出るのは支保の掛からない大穴で、トンネルではない。
- */
-const TUNNEL_COVER_FACTOR = 2.85;
-
-/**
  * トンネル断面の半径 [m]。路面幅に建築限界を足したもの。
  * 分類 (ここ) と実際の掘削 (Roadworks) で必ず同じ値を使うこと。
- * ずれると「トンネルと言われた区間を掘っても土被りが付かない」が起きる。
  */
 export function tunnelRadius(std: RoadStandard): number {
   return std.width / 2 + 1.6;
+}
+
+/**
+ * 坑道の中心を路面からどれだけ上げるか (半径に対する比)。
+ *
+ * 路面は円形断面の下のほうに載るので、中心は路面より上にある。
+ * 現実の 2 車線道路トンネルは馬蹄形で、天端は路面から 6 m ほど。
+ * 山岳規格 (R = 4.85 m) でそれに合わせると 6.1 m = 1.25 R なので、
+ * 中心は路面の 0.25 R 上。
+ *
+ * **掘る側 (`Roadworks.boreTunnels`) と、トンネルになるかを測る側
+ * (`classify`) が必ず同じ値を使うこと。** ずれると「トンネルと分類した所を
+ * 掘っても土被りが付かない」が起きる。だから両方がここを呼ぶ。
+ */
+export const BORE_CENTER_RATIO = 0.25;
+
+/** 路面高 roadY・半径 r のとき、坑道の中心が来る高さ [m]。 */
+export function boreCenterY(roadY: number, r: number): number {
+  return roadY + r * BORE_CENTER_RATIO;
+}
+
+/**
+ * 地形の読み口。
+ *
+ * このモジュールは**何も import しない**(`three` も terrain 層も) ので、
+ * 地形は関数で受ける。おかげで規格の解き方だけを合成地形で単体試験できるし、
+ * 依存の向きも保たれる。
+ *
+ * `tunnelAt` が**土被りの値ではなく真偽**なのが要点。値を受け取ると、
+ * 「いくつ以上ならトンネルか」という閾値をこちら側にもう 1 つ持つことになり、
+ * それは今回消したい重複そのもの。判定は `Tunnel.isTunnelCover` に 1 つだけ
+ * 置き、プローブを組む側 (Roadworks / main / テスト) がそれを呼ぶ。
+ */
+export interface TerrainProbe {
+  /** 地盤高 [m]。 */
+  groundAt(x: number, z: number): number;
+  /**
+   * (x, y, z) を中心に半径 r の坑道を置いたら、トンネルとして成立するか。
+   * 実装は `Tunnel.isTunnelCover(Tunnel.coverAtCrown(...), r)`。
+   */
+  tunnelAt(x: number, y: number, z: number, r: number): boolean;
 }
 
 /** これ以下の差は「平坦」として扱う [m]。 */
@@ -466,14 +481,47 @@ export function solveProfile(
  * 「ここはトンネル」と宣言してから地面を見るのではなく、規格を満たす線を
  * 引いた結果として地面が上に来ていればトンネル、下に離れていれば橋になる。
  * だから制御点を 1 つ動かすと種別がひとりでに入れ替わる。
+ *
+ * ---- トンネルだけは高さの引き算で決めない ----
+ * 橋は「盛土が高すぎる」= 高さの差でよいが、トンネルは
+ * **そこに坑道を置いたら土被りが付くか**そのものを聞く (`probe.tunnelAt`)。
+ *
+ * 以前は「計画高と地盤高の差 > 2.85 R」という差の閾値で分類していた。
+ * 差と土被りは別の量なので、定数を揃えても原理的にずれる。実際、閾値を
+ * 12 m にしていたときは 22 m のトンネル区間を掘って**登録された区間が 0 本**に
+ * なった (支保も崩落も掛からず、回廊の切盛も飛ばされる大穴)。
+ * 掘る側と同じ述語を同じ位置で聞けば、この食い違いは原理的に消える。
+ *
+ * 差では測れないもの — オーバーハングの下、既に掘った坑道の真上、盛土の下 —
+ * も、レイマーチならそのまま正しく出る。
  */
-function classify(stations: Station[], step: number, std: RoadStandard): void {
-  const cutMax = Math.max(CUT_MAX_MIN, TUNNEL_COVER_FACTOR * tunnelRadius(std));
-  for (const st of stations) {
+function classify(
+  stations: Station[],
+  step: number,
+  std: RoadStandard,
+  probe: TerrainProbe,
+): void {
+  const r = tunnelRadius(std);
+  /** その測点に坑道を置いたらトンネルとして成立するか。取り込み規則でも使う。 */
+  const coverOk: boolean[] = new Array(stations.length).fill(false);
+
+  for (let i = 0; i < stations.length; i++) {
+    const st = stations[i];
     const d = st.y - st.ground;
-    if (d > FILL_MAX) st.kind = RoadKind.Bridge;
-    else if (d < -cutMax) st.kind = RoadKind.Tunnel;
-    else if (Math.abs(d) < FLAT_EPS) st.kind = RoadKind.Flat;
+    if (d > FILL_MAX) {
+      st.kind = RoadKind.Bridge;
+      continue;
+    }
+    // 地盤が計画高より上にある所だけ聞く。盛土や橋でレイマーチしても
+    // 空を撃つだけで、制御点を置くたびに走る計算が無駄に重くなる。
+    if (d < 0) {
+      coverOk[i] = probe.tunnelAt(st.x, boreCenterY(st.y, r), st.z, r);
+      if (coverOk[i]) {
+        st.kind = RoadKind.Tunnel;
+        continue;
+      }
+    }
+    if (Math.abs(d) < FLAT_EPS) st.kind = RoadKind.Flat;
     else if (d > 0) st.kind = RoadKind.Fill;
     else st.kind = RoadKind.Cut;
   }
@@ -500,6 +548,12 @@ function classify(stations: Station[], step: number, std: RoadStandard): void {
   // 逆に、橋 (トンネル) に挟まれた短い切盛は構造物に取り込む。
   // 橋の途中で 6 m だけ盛土に落ちると、橋台を 2 組建てて盛土を挟むことになり、
   // 通しで架けるより高くつくうえ見た目も破綻する。
+  //
+  // ただし**トンネルへの取り込みは、隙間の測点が全部土被りを持つときだけ。**
+  // 鞍部を挟んだ 2 本の坑道を無条件に繋ぐと、鞍部には土被りが無いのに
+  // トンネルということになり、掘っても登録されない (分類と登録がずれる)
+  // という同じ不具合の小型版が出る。一部だけ取り込むと区間が虫食いになるので、
+  // 全部通るときだけ繋ぐ。橋は土被りと無関係なので条件なしでよい。
   for (const target of [RoadKind.Bridge, RoadKind.Tunnel] as const) {
     for (let i = 0; i < stations.length; ) {
       if (stations[i].kind !== target) { i++; continue; }
@@ -508,7 +562,13 @@ function classify(stations: Station[], step: number, std: RoadStandard): void {
       // j はこの構造物の終わり。次の構造物までの隙間を測る。
       let k = j;
       while (k < stations.length && stations[k].kind !== target) k++;
-      if (k < stations.length && k - j < minRun) {
+      let fillable = k < stations.length && k - j < minRun;
+      if (fillable && target === RoadKind.Tunnel) {
+        for (let m = j; m < k; m++) {
+          if (!coverOk[m]) { fillable = false; break; }
+        }
+      }
+      if (fillable) {
         for (let m = j; m < k; m++) stations[m].kind = target;
         continue; // i は動かさず、繋がった区間として測り直す
       }
@@ -523,12 +583,12 @@ function classify(stations: Station[], step: number, std: RoadStandard): void {
  * 制御点から線形を作る。
  *
  * @param control 制御点 (平面座標)。2 点未満なら空の線形を返す。
- * @param groundAt 地盤高を返す関数。terrain 層を game 層から切り離すために
- *                 関数で受ける (このモジュールは純粋なので単体で試験できる)。
+ * @param probe 地形の読み口。terrain 層を切り離すために関数で受ける
+ *              (このモジュールは何も import しないので単体で試験できる)。
  */
 export function buildAlignment(
   control: readonly Vec2[],
-  groundAt: (x: number, z: number) => number,
+  probe: TerrainProbe,
   std: RoadStandard,
   step = STATION_STEP,
 ): Alignment {
@@ -552,7 +612,7 @@ export function buildAlignment(
   const minRadius = measureMinRadius(poly);
 
   // 3) 地盤を読んで縦断を解く
-  const ground = poly.map((p) => groundAt(p.x, p.z));
+  const ground = poly.map((p) => probe.groundAt(p.x, p.z));
   const y = solveProfile(ground, step, std);
 
   // 4) 測点を組み立てる
@@ -583,7 +643,7 @@ export function buildAlignment(
       kind: RoadKind.Flat,
     });
   }
-  classify(stations, step, std);
+  classify(stations, step, std, probe);
 
   let maxGrade = 0;
   for (const st of stations) maxGrade = Math.max(maxGrade, Math.abs(st.grade));

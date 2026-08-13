@@ -8,16 +8,17 @@ import { ANISO_CENTER, type ReposeSystem } from '../terrain/Repose';
 import type { VoxelField } from '../terrain/VoxelField';
 import type { ChunkManager } from '../terrain/ChunkManager';
 import {
-  RoadKind, runsOf, tunnelRadius, type Alignment, type Station, STATION_STEP,
+  RoadKind, runsOf, tunnelRadius, boreCenterY,
+  type Alignment, type Station, type TerrainProbe, STATION_STEP,
 } from './Alignment';
-
-export { tunnelRadius };
+import { coverAtCrown, isTunnelCover, type TunnelNetwork } from './Tunnel';
 import {
   BridgeNetwork, planBridge, type BridgePlan, type GeoSampler, type PierSite,
 } from './Bridge';
 import { Economy } from './Economy';
 import type { Crew, CrewJob } from './Crew';
-import type { TunnelNetwork } from './Tunnel';
+
+export { tunnelRadius };
 
 /**
  * 道路の施工。線形 (Alignment) を地形に落とし込む所。
@@ -81,18 +82,18 @@ const CAP_BAND = 1.5;
 const CAP_PROTECT_LEVEL = 3;
 
 /**
- * 坑道の中心を路面からどれだけ上げるか (半径に対する比)。
+ * 実物の地形プローブ。線形の分類 (`Alignment.classify`) に渡す。
  *
- * 路面は円形断面の下のほうに載るので、中心は路面より上にある。
- * 現実の 2 車線道路トンネルは馬蹄形で、天端は路面から 6 m ほど。
- * 山岳規格 (R = 4.85 m) でそれに合わせると 6.1 m = 1.25 R なので、
- * 中心は路面の 0.25 R 上。ここを 0.55 にすると天端が 7.5 m になり、
- * 建築限界としては過剰なだけでなく、**トンネルにする切土深さの下限を
- * 1.5 m 押し上げる** (§4f)。
- *
- * インバート (路盤) の埋め戻しまでは模型化していない。
+ * **トンネルかどうかの判定を、掘る側とまったく同じ述語で答えるのが役目。**
+ * `Alignment` は何も import しない純粋モジュールなので、terrain と Tunnel を
+ * 知っているこちら側で組んでやる。テストは同じ形の合成プローブを渡す。
  */
-const BORE_CENTER_RATIO = 0.25;
+export function terrainProbe(field: VoxelField, index: HeightIndex): TerrainProbe {
+  return {
+    groundAt: (x, z) => groundHeightAt(index, x, z),
+    tunnelAt: (x, y, z, r) => isTunnelCover(coverAtCrown(field, x, y, z, r), r),
+  };
+}
 
 /** 列 (x,z) の地盤高を双一次補間で読む。線形は 0.5 m 格子より細かく刻むため。 */
 export function groundHeightAt(index: HeightIndex, x: number, z: number): number {
@@ -408,7 +409,7 @@ export function planRoad(
     let n = 0;
     for (let i = from; i < to; i++) {
       const st = al.stations[i];
-      cost += DIG_COST[field.materialAt(st.x, st.y + r * BORE_CENTER_RATIO, st.z)];
+      cost += DIG_COST[field.materialAt(st.x, boreCenterY(st.y, r), st.z)];
       n++;
     }
     tunnelCost += (vol * cost) / Math.max(1, n);
@@ -604,8 +605,8 @@ export class RoadNetwork {
       for (let i = i0; i < i1; i++) {
         const a = al.stations[i];
         const b = al.stations[i + 1];
-        const ay = a.y + r * BORE_CENTER_RATIO;
-        const by = b.y + r * BORE_CENTER_RATIO;
+        const ay = boreCenterY(a.y, r);
+        const by = boreCenterY(b.y, r);
         const res = applyCapsule(
           field, chunks,
           a.x, ay, a.z, b.x, by, b.z,

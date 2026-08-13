@@ -3,7 +3,7 @@ import {
   buildAlignment, ROAD_STANDARDS, RoadKind, lengthByKind,
   type Vec2, type Station,
 } from './Alignment';
-import { planRoad, RoadNetwork, groundHeightAt, tunnelRadius } from './Roadworks';
+import { planRoad, RoadNetwork, groundHeightAt, tunnelRadius, terrainProbe } from './Roadworks';
 import { BridgeNetwork } from './Bridge';
 import { Crew } from './Crew';
 import { Economy } from './Economy';
@@ -82,8 +82,17 @@ function mkWorld(h: (x: number, z: number) => number, geo: Geo = Geo.Soil): Worl
 const trueGeo = (w: World) => (x: number, y: number, z: number): Geo =>
   w.field.materialAt(x, y, z);
 
+/**
+ * 実物の地形を使いつつ、計画高だけを地盤より `drop` m 下へ引き込むプローブ。
+ * 「深さ一定の切土」を作るのに使う。トンネルの判定は実物のまま。
+ */
+function lowerBy(w: World, drop: number) {
+  const real = terrainProbe(w.field, w.index);
+  return { ...real, groundAt: (x: number, z: number) => real.groundAt(x, z) - drop };
+}
+
 function makeRoad(w: World, control: Vec2[], std = STD) {
-  const al = buildAlignment(control, (x, z) => groundHeightAt(w.index, x, z), std);
+  const al = buildAlignment(control, terrainProbe(w.field, w.index), std);
   const plan = planRoad(w.field, w.index, al, w.economy, trueGeo(w));
   const road = w.roads.build(
     w.field, chunks, w.index, w.repose, w.tunnels, w.bridges, w.economy, plan,
@@ -131,7 +140,7 @@ describe('回廊の切盛', () => {
     const w = mkWorld(() => 30);
     const al = buildAlignment(
       [{ x: 20, z: 64 }, { x: 100, z: 64 }],
-      () => 22,
+      lowerBy(w, 8),
       ROAD_STANDARDS[1],
     );
     const plan = planRoad(w.field, w.index, al, w.economy, trueGeo(w));
@@ -155,7 +164,7 @@ describe('回廊の切盛', () => {
 
   it('掘り下げれば残土が出る — 既存の Economy をそのまま通っている', () => {
     const w = mkWorld(() => 30);
-    const al = buildAlignment([{ x: 20, z: 64 }, { x: 100, z: 64 }], () => 22, STD);
+    const al = buildAlignment([{ x: 20, z: 64 }, { x: 100, z: 64 }], lowerBy(w, 8), STD);
     const plan = planRoad(w.field, w.index, al, w.economy, trueGeo(w));
     expect(plan.cutVolume).toBeGreaterThan(0);
     expect(plan.fillVolume).toBeLessThan(plan.cutVolume * 0.05);
@@ -238,19 +247,28 @@ describe('トンネル区間', () => {
     }
   });
 
-  it('トンネルと分類した長さのぶん、区間が実際に登録される', () => {
-    // 分類の閾値が断面の大きさより浅いと、掘ったのに土被りが足りず
-    // 区間が 1 本も登録されない = 支保も崩落も掛からない大穴が開く。
-    // 実測でそうなっていた (22 m 掘って区間 0 本)。
+  it('トンネルと分類した区間は、坑口を除いてすべて台帳に載る', () => {
+    // これがこのファイルでいちばん大事なテスト。
+    //
+    // 分類 (Alignment) と登録 (Tunnel.recordBore) が**別の量**を測っていた頃は、
+    // 掘ったのに区間が 1 本も登録されないことがあった (実測: 22 m 掘って 0 本)。
+    // そうなるとその帯は支保も崩落も掛からず、しかも回廊の切盛は
+    // 「トンネル区間だから」と飛ばすので切土でもない大穴になる。
+    // いまは両方が `Tunnel.isTunnelCover` という 1 つの述語を呼ぶので、
+    // ずれるのは坑口だけのはず。
     for (const std of ROAD_STANDARDS) {
-      const w = mkWorld((x) => 16 + 34 * Math.exp(-((x - 64) ** 2) / (2 * 12 * 12)), Geo.Rock);
+      const w = mkWorld((x) => 16 + 40 * Math.exp(-((x - 64) ** 2) / (2 * 12 * 12)), Geo.Rock);
       const { al, plan } = makeRoad(w, [{ x: 8, z: 64 }, { x: 120, z: 64 }], std);
       const classified = lengthByKind(al)[RoadKind.Tunnel];
       if (classified < 12) continue; // その規格ではトンネルにならない地形
-      const segs = w.tunnels.segments.filter((s) => s.isTunnel);
-      // 坑口寄りは土被りが足りないので全長ぶんは載らない。半分は載ること。
-      expect(segs.length * SEGMENT_LENGTH).toBeGreaterThan(classified * 0.5);
       expect(plan.tunnelLength).toBeCloseTo(classified, 6);
+
+      const registered = w.tunnels.segments.filter((s) => s.isTunnel).length * SEGMENT_LENGTH;
+      // 坑口の土被りは、分類のあとに当てる取付部の切土で削られる。
+      // 一巡で計画する以上ここは消せないので、両端 1 測点ぶんだけ許す。
+      const portalSlack = 2 * SEGMENT_LENGTH * 2;
+      expect(registered).toBeGreaterThanOrEqual(classified - portalSlack);
+      expect(registered).toBeLessThanOrEqual(classified + portalSlack);
     }
   });
 
@@ -268,7 +286,7 @@ describe('見積り', () => {
     const w = mkWorld(() => 30);
     const al = buildAlignment(
       [{ x: 20, z: 64 }, { x: 100, z: 64 }],
-      (x, z) => groundHeightAt(w.index, x, z),
+      terrainProbe(w.field, w.index),
       ROAD_STANDARDS[1],
     );
     w.economy.money = 10;

@@ -2,21 +2,40 @@ import { describe, it, expect } from 'vitest';
 import {
   buildAlignment, solveProfile, measureMinRadius, resampleUniform, circumRadius,
   ROAD_STANDARDS, RoadKind, STATION_STEP, lengthByKind, runsOf,
-  type Vec2, type RoadStandard,
+  boreCenterY, tunnelRadius,
+  type Vec2, type RoadStandard, type TerrainProbe,
 } from './Alignment';
+import { isTunnelCover } from './Tunnel';
 
 /**
- * 線形。押さえたいのは 3 つ。
+ * 線形。押さえたいのは 4 つ。
  *   1. 規格 (最小曲線半径 / 最大勾配 / 縦断曲線) を**必ず**満たすこと。
  *      満たせないなら、黙って規格外を返さずに ok = false で言うこと。
  *   2. 制御点が急でも壊れないこと (発散も振動もしない)。
  *   3. 区間の種別が地形との差だけで決まり、短すぎる橋・トンネルが出ないこと。
+ *   4. トンネルの判定が**掘る側と同じ述語**であること。ここがずれると
+ *      「掘ったのに登録されない大穴」ができる。
  */
 
 const MOUNTAIN = ROAD_STANDARDS[0];
 const STANDARD = ROAD_STANDARDS[1];
 
-const flat = (): number => 20;
+/**
+ * 高さ場からプローブを組む。
+ *
+ * 土被りの判定は**本物の述語 (`Tunnel.isTunnelCover`) をそのまま呼ぶ**。
+ * ここで閾値を書き写すと、まさに今回消した重複がテストの中に復活する。
+ * 高さ場にはオーバーハングが無いので、天端から上の土被りは
+ * `地盤 - 天端` で厳密に一致する。
+ */
+function probeOf(ground: (x: number, z: number) => number): TerrainProbe {
+  return {
+    groundAt: ground,
+    tunnelAt: (x, y, z, r) => isTunnelCover(Math.max(0, ground(x, z) - (y + r)), r),
+  };
+}
+
+const flat = probeOf(() => 20);
 
 describe('曲率の制約', () => {
   it('直角に折れた制御点でも最小曲線半径を下回らない', () => {
@@ -152,7 +171,7 @@ describe('区間の分類', () => {
   it('谷は橋、尾根は切土 — 種別は地形との差だけで決まる', () => {
     const al = buildAlignment(
       [{ x: 10, z: 64 }, { x: 118, z: 64 }],
-      (x) => ground(x),
+      probeOf((x) => ground(x)),
       STANDARD,
     );
     const kinds = new Set(al.stations.map((s) => s.kind));
@@ -165,7 +184,7 @@ describe('区間の分類', () => {
     // 幅 4 m だけ深い溝。橋にするには短すぎる。
     const al = buildAlignment(
       [{ x: 10, z: 64 }, { x: 118, z: 64 }],
-      (x) => (Math.abs(x - 64) < 2 ? 8 : 30),
+      probeOf((x) => (Math.abs(x - 64) < 2 ? 8 : 30)),
       MOUNTAIN,
     );
     for (const [from, to] of runsOf(al, RoadKind.Bridge)) {
@@ -179,10 +198,68 @@ describe('区間の分類', () => {
   it('尾根が高ければトンネルになる', () => {
     const al = buildAlignment(
       [{ x: 10, z: 64 }, { x: 118, z: 64 }],
-      (x) => 18 + 54 * Math.exp(-((x - 64) ** 2) / (2 * 11 * 11)),
+      probeOf((x) => 18 + 54 * Math.exp(-((x - 64) ** 2) / (2 * 11 * 11))),
       STANDARD,
     );
     expect(lengthByKind(al)[RoadKind.Tunnel]).toBeGreaterThan(20);
+  });
+
+  it('土被りが無ければトンネルにしない — 高さの差が同じでも', () => {
+    // 分類が「計画高と地盤高の差」で決めていた頃に出た不具合の再現。
+    // 差は同じでも、天端の上に地山が残っていなければトンネルではない
+    // (オーバーハングの下、既に掘った坑道の真上、盛土の下)。
+    const ridge = (x: number): number => 18 + 54 * Math.exp(-((x - 64) ** 2) / (2 * 11 * 11));
+    const control: Vec2[] = [{ x: 10, z: 64 }, { x: 118, z: 64 }];
+
+    const solid = buildAlignment(control, probeOf(ridge), STANDARD);
+    expect(lengthByKind(solid)[RoadKind.Tunnel]).toBeGreaterThan(20);
+
+    // 同じ高さ場だが、天端の上に残る地山は 0.5 m しか無い
+    const hollow: TerrainProbe = {
+      groundAt: ridge,
+      tunnelAt: (_x, _y, _z, r) => isTunnelCover(0.5, r),
+    };
+    const al = buildAlignment(control, hollow, STANDARD);
+    expect(lengthByKind(al)[RoadKind.Tunnel]).toBe(0);
+    // 高さの差は 20 m 以上ある = 差で分類していたらトンネルになっていた
+    const maxCut = Math.max(...al.stations.map((s) => s.ground - s.y));
+    expect(maxCut).toBeGreaterThan(20);
+  });
+
+  it('土被りを聞く位置が、掘る位置 (坑道の中心) と同じ', () => {
+    // ここがずれると「トンネルと分類した所を掘っても土被りが付かない」が起きる。
+    const ridge = (x: number): number => 18 + 54 * Math.exp(-((x - 64) ** 2) / (2 * 11 * 11));
+    const r = tunnelRadius(STANDARD);
+    const asked: { x: number; y: number; z: number; r: number }[] = [];
+    const spy: TerrainProbe = {
+      groundAt: ridge,
+      tunnelAt: (x, y, z, rr) => {
+        asked.push({ x, y, z, r: rr });
+        return false;
+      },
+    };
+    const al = buildAlignment([{ x: 10, z: 64 }, { x: 118, z: 64 }], spy, STANDARD);
+
+    expect(asked.length).toBeGreaterThan(10);
+    for (const a of asked) {
+      expect(a.r).toBeCloseTo(r, 9);
+      const st = al.stations.find((s) => s.x === a.x && s.z === a.z);
+      expect(st).toBeDefined();
+      expect(a.y).toBeCloseTo(boreCenterY(st!.y, r), 9);
+    }
+  });
+
+  it('盛土や橋では土被りを聞かない (制御点を置くたびに走るので無駄撃ちしない)', () => {
+    let calls = 0;
+    const spy: TerrainProbe = {
+      // 深い谷。計画高はずっと地盤より上になる。
+      groundAt: (x) => 40 - 30 * Math.exp(-((x - 64) ** 2) / (2 * 10 * 10)),
+      tunnelAt: () => { calls++; return false; },
+    };
+    const al = buildAlignment([{ x: 40, z: 64 }, { x: 88, z: 64 }], spy, STANDARD);
+    const above = al.stations.filter((s) => s.y - s.ground > 0).length;
+    expect(above).toBeGreaterThan(10);
+    expect(calls).toBeLessThan(al.stations.length - above + 1);
   });
 
   it('トンネルにする深さは断面の大きさで決まる — 幅が広いほど深くないと潜れない', () => {
@@ -190,8 +267,8 @@ describe('区間の分類', () => {
     // 掘っても土被りが付かない深さでトンネルと言ってはいけない。
     const ridge = (x: number): number => 18 + 44 * Math.exp(-((x - 64) ** 2) / (2 * 13 * 13));
     const control: Vec2[] = [{ x: 10, z: 64 }, { x: 118, z: 64 }];
-    const m = lengthByKind(buildAlignment(control, ridge, MOUNTAIN))[RoadKind.Tunnel];
-    const s = lengthByKind(buildAlignment(control, ridge, STANDARD))[RoadKind.Tunnel];
+    const m = lengthByKind(buildAlignment(control, probeOf(ridge), MOUNTAIN))[RoadKind.Tunnel];
+    const s = lengthByKind(buildAlignment(control, probeOf(ridge), STANDARD))[RoadKind.Tunnel];
     expect(m).toBeGreaterThan(s);
   });
 });

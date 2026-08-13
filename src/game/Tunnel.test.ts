@@ -7,7 +7,7 @@ import { CELL, NX, NY, NZ, Geo, WATER_TABLE_Y } from '../terrain/config';
 /**
  * 必要支保レベルの判定。企画の表をそのまま数値で固定しておく。
  *   岩 0 / 土 1 / 軟弱 2、水位より下なら +1、土被りが薄ければ +1、
- *   土被りが掘削半径の 1.5 倍未満ならそもそもトンネル扱いしない。
+ *   土被りが掘削半径の 1.2 倍未満ならそもそもトンネル扱いしない。
  * ここが崩れるとゲームの判断がまるごと変わるので、目視ではなく数値で押さえる。
  */
 
@@ -110,7 +110,7 @@ describe('必要支保レベル', () => {
   });
 
   it('土被りが浅いと +1', () => {
-    // 掘削半径の 1.5 倍 < 土被り < 3 倍 に入る高さ
+    // 掘削半径の 1.2 倍 < 土被り < 3 倍 に入る高さ
     const shallowY = SURFACE_Y - R * 1.05 - R * 2.0;
     const s = segAt(X_ROCK, shallowY, 60);
     net.evaluate(field, s);
@@ -121,7 +121,7 @@ describe('必要支保レベル', () => {
     expect(s.required).toBe(1);
   });
 
-  it('土被りが掘削半径の 1.5 倍未満ならトンネル扱いしない (切土・坑口)', () => {
+  it('土被りが掘削半径の 1.2 倍未満ならトンネル扱いしない (切土・坑口)', () => {
     const openY = SURFACE_Y - R * 1.05 - R * 0.8;
     const s = segAt(X_WEAK, openY, 60);
     net.evaluate(field, s);
