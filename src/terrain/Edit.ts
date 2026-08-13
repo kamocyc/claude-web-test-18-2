@@ -21,6 +21,15 @@ export interface EditResult {
   /** 影響範囲のワールド AABB。構造物の再評価に使う。 */
   min: [number, number, number];
   max: [number, number, number];
+  /**
+   * 編集した**形そのもの**が届いた高さの上限 [m]。AABB の余白を含まない。
+   *
+   * max[1] は形を pad (半径 + ブレンド幅 + 2 セル = 4.1 m) ぶん膨らませた値
+   * なので、「その列の地表まで掘削が届いたか」の判定には使えない。
+   * 4.1 m 高く見えるので、地表を触っていない列まで触ったことにしてしまう。
+   * 安息角の整定がこれを使う (Repose.seedFromEdit)。
+   */
+  reachY: number;
 }
 
 const EMPTY: EditResult = {
@@ -29,6 +38,7 @@ const EMPTY: EditResult = {
   changed: false,
   min: [0, 0, 0],
   max: [0, 0, 0],
+  reachY: -Infinity,
 };
 
 export type EditMode = 'dig' | 'fill';
@@ -134,6 +144,7 @@ export function applyCapsule(
     changed: true,
     min: [minX, minY, minZ],
     max: [maxX, maxY, maxZ],
+    reachY: Math.max(ay, by) + radius,
   };
 }
 
@@ -151,6 +162,11 @@ export interface ColumnHeightWrite {
   floor: number;
   /** 新しく固体になったノードに入れる地質 (運ばれてきた土の地質)。 */
   geo: Geo;
+  /**
+   * 削るときに上端をここまで伸ばす [m]。地表として採らなかった薄い庇の上端。
+   * 庇を残すと、その列だけ高く取り残されて柱になる。
+   */
+  ceil: number;
 }
 
 /** 地表の上下に余分に書き直す幅 [m]。ここで古い値と繋がる。 */
@@ -193,9 +209,11 @@ export function applyColumnHeights(
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let reachY = -Infinity;
 
   for (const c of cols) {
     const { i, k, hOld, hNew, inv, floor, geo } = c;
+
     if (i < 1 || i > NX - 2 || k < 1 || k > NZ - 2) continue;
     if (hNew === hOld) continue;
     const erode = hNew < hOld;
@@ -204,7 +222,7 @@ export function applyColumnHeights(
     const yLo = erode
       ? hNew - COLUMN_MARGIN
       : Math.max(hOld - COLUMN_MARGIN, floor);
-    const yHi = (erode ? hOld : hNew) + COLUMN_MARGIN;
+    const yHi = (erode ? Math.max(hOld, c.ceil) : hNew) + COLUMN_MARGIN;
 
     // j = 0 は Generator が常に空気にしている床。触ると世界の底が抜ける。
     const j0 = Math.max(1, Math.ceil(yLo / CELL));
@@ -248,6 +266,8 @@ export function applyColumnHeights(
     if (z > maxZ) maxZ = z;
     if (j0 * CELL < minY) minY = j0 * CELL;
     if (j1 * CELL > maxY) maxY = j1 * CELL;
+    if (hOld > reachY) reachY = hOld;
+    if (hNew > reachY) reachY = hNew;
   }
 
   if (!changed) return EMPTY;
@@ -264,6 +284,7 @@ export function applyColumnHeights(
     changed: true,
     min: [minX, minY, minZ],
     max: [maxX, maxY, maxZ],
+    reachY,
   };
 }
 
@@ -288,5 +309,6 @@ export function mergeEdits(a: EditResult, b: EditResult): EditResult {
       Math.max(a.max[1], b.max[1]),
       Math.max(a.max[2], b.max[2]),
     ],
+    reachY: Math.max(a.reachY, b.reachY),
   };
 }

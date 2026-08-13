@@ -1,5 +1,4 @@
 import { CELL, NX, NZ, Geo, LOOSEN_MAX_DEPTH, ROOF_KEEP } from './config';
-import { clamp } from './FieldMath';
 import { applyColumnHeights, type ColumnHeightWrite, type EditResult } from './Edit';
 import { HeightIndex, colIdx, isRimColumn, NO_SURFACE, NO_VOID } from './HeightIndex';
 import type { VoxelField } from './VoxelField';
@@ -95,6 +94,13 @@ export class ReposeSystem {
   /** 前回の書き戻し以降、土を受け取った列。 */
   private gained = new Uint8Array(NX * NZ);
 
+  /** ゆるみを横へ広げるときの作業列。 */
+  private looseQueue: number[] = [];
+  private inLooseQueue = new Uint8Array(NX * NZ);
+
+  /** その列の地表まで掘削が届いた高さの、これまでの最大値 [m]。 */
+  private reachMax = new Float64Array(NX * NZ).fill(-Infinity);
+
   private scratchLam = new Float64Array(NB_N);
   private scratchOff = new Int32Array(NB_N);
 
@@ -110,12 +116,23 @@ export class ReposeSystem {
   /**
    * 編集を受けて種を撒く。列を測り直し、掘った所の原地盤をゆるませる。
    *
-   * ゆるませるのは「編集が今の地表まで届いている列」だけ。深いトンネルの
-   * 掘削 AABB でゆるませてしまうと、地表を触っていないのに山腹が崩れ出す。
+   * **ゆるませる厚みは「実際にその列の地表が動いた量」で決める。**
+   * 編集の AABB の深さで決めてはいけない。AABB はカプセルを等方に 4.1 m
+   * 膨らませたものなので、
+   *   - 1 m^3 も減っていない横の列にも同じ厚みが入る
+   *   - 厚みが「地表がボア軸より上にある高さ」に比例してしまい、
+   *     掘っていない上流ほど厚くゆるむという逆立ちした式になる
+   * 実測で、1 フレームに掘れる 50 m^3 に対して 330 m^3 が原地盤 (58 度) から
+   * ゆるみ土砂 (34 度) に書き換わっていた。斜面にトンネルを掘ろうとすると
+   * 坑口の上 4-6 m 山側までが一斉にゆるんで坑口へ流れ込み、掘れなくなる。
+   *
+   * 地表の低下量で測れば、土被りの下を抜けた坑道 (地表が動かない) は
+   * ゼロになる。坑口の切り欠きだけが安息角まで寝て、その上の斜面は
+   * 原地盤として立ったままになる。
    */
-  seedFromEdit(field: VoxelField, min: readonly number[], max: readonly number[]): void {
-    const { heights } = this.index;
-    this.index.measureAABB(field, min[0], min[2], max[0], max[2]);
+  seedFromEdit(field: VoxelField, res: EditResult): void {
+    const { min, max } = res;
+    const { heights, loose } = this.index;
 
     const i0 = Math.max(1, Math.floor(min[0] / CELL));
     const i1 = Math.min(NX - 2, Math.ceil(max[0] / CELL));
@@ -125,13 +142,92 @@ export class ReposeSystem {
     for (let k = k0; k <= k1; k++) {
       for (let i = i0; i <= i1; i++) {
         const o = colIdx(i, k);
+        const hPrev = heights[o];
+        this.index.measureColumn(field, i, k);
         if (heights[o] === NO_SURFACE) continue;
-        if (max[1] >= heights[o] - CELL) {
-          this.index.loosen(o, clamp(heights[o] - min[1], 0, LOOSEN_MAX_DEPTH));
+        if (res.reachY > this.reachMax[o]) this.reachMax[o] = res.reachY;
+
+        // 1 フレームぶんの低下は数 cm なので、最大値ではなく**積算**する。
+        // 最大値だと総掘削深さを取りこぼし、深い切土でも法面が寝ない。
+        // 絶対値なのは盛土のため。置いた土はそれ自体がゆるみ土砂。
+        if (hPrev !== NO_SURFACE) {
+          const moved = Math.abs(hPrev - heights[o]);
+          if (moved > 0) {
+            this.index.loosen(o, Math.min(loose[o] + moved, LOOSEN_MAX_DEPTH));
+            if (!this.inLooseQueue[o]) {
+              this.inLooseQueue[o] = 1;
+              this.looseQueue.push(o);
+            }
+          }
         }
         this.activate(o);
       }
     }
+    this.spreadLoose();
+  }
+
+  /**
+   * ゆるみを横へ広げる。`loose[n] >= loose[o] - 距離 * tan(安息角)`。
+   *
+   * 掘って地表が下がるのは**掘った穴の底**だが、寝てほしいのはその**壁**で、
+   * 壁の列は地表が下がっていないので、低下量だけを見ているとゆるまない。
+   * 実測: 深さ 6 m の開削の法面が 87 度で立ったままになった。
+   *
+   * 広げる距離は「その深さの法面が安息角で寝るのに要る幅」= 深さ/tan(安息角)
+   * そのものなので、任意の半径を決め打ちする必要が無い。深さ 5 m の切土なら
+   * 7.4 m まで。そこから先は原地盤なので動かない。**有限で止まる。**
+   *
+   * 「掘った所」を旗にして隣へ伝染させる方式とは別物であることに注意。
+   * あれは受け手が旗を貰って上流へ塗り広がるので止まらない。こちらは
+   * 掘った深さから決まる円錐を 1 回置くだけで、崩れても広がらない。
+   *
+   * **天端を持つ列 (下に空洞がある = 坑道の上) には広げない。** 坑口の
+   * 開いた区間と、その奥の坑道は形としては同じ「深い溝」なので、
+   * 区別できるのは「上に地山が架かっているかどうか」だけ。ここで広げると
+   * 坑道の真上の地山がゆるみ、土被りが付く前に天端が消える
+   * (実測: 15 m 掘り進んでも土被り 0、動いた土量が掘削量の 20 倍)。
+   *
+   * 広げてよいのは、**過去に一度でも掘削がその列の地表まで届いた**列だけ
+   * (reachMax)。届いていない列は、これから坑道になる地山であって切土の
+   * 法面ではない。この蓋が無いと、坑口の溝から出た円錐が掘削ヘッドより
+   * 先へ伸びて、土被りが付く前に前方の地山を寝かせてしまう
+   * (実測: 15 m 掘り進んでも土被り 0)。
+   *
+   * 「過去に一度でも」なのは、深い切土は何度も掘り下げるから。今の掘削の
+   * 上端だけを見ると、2 回目以降は法面の天端より下になり、壁が原地盤のまま
+   * 垂直に立ち尽くす (実測 80 度)。reachMax は掘削の形からしか立たないので、
+   * 崩落で伝染することはない。
+   */
+  private spreadLoose(): void {
+    const { heights, loose, looseMat, voidTop } = this.index;
+    const queue = this.looseQueue;
+    for (let head = 0; head < queue.length; head++) {
+      const o = queue[head];
+      this.inLooseQueue[o] = 0;
+      const i = o % NX;
+      const k = (o / NX) | 0;
+      const t = this.index.reposeTan(o);
+      const src = loose[o];
+      for (let q = 0; q < NB_N; q++) {
+        const ni = i + NB_DI[q];
+        const nk = k + NB_DK[q];
+        if (isRimColumn(ni, nk)) continue;
+        const no = ni + nk * NX;
+        if (heights[no] === NO_SURFACE) continue;
+        if (voidTop[no] !== NO_VOID) continue;
+        if (this.reachMax[no] < heights[no] - CELL) continue;
+        const v = Math.min(src - t * NB_DIST[q], heights[no], LOOSEN_MAX_DEPTH);
+        if (v <= loose[no] + MIN_MOVE) continue;
+        if (loose[no] <= 0) looseMat[no] = looseMat[o];
+        loose[no] = v;
+        this.activate(no);
+        if (!this.inLooseQueue[no]) {
+          this.inLooseQueue[no] = 1;
+          queue.push(no);
+        }
+      }
+    }
+    queue.length = 0;
   }
 
   /**
@@ -153,9 +249,15 @@ export class ReposeSystem {
         const o = colIdx(i, k);
         if (heights[o] === NO_SURFACE) continue;
         this.index.loosen(o, Math.min(loosenDepth, Math.max(0, heights[o])));
+        this.reachMax[o] = Infinity;
         this.activate(o);
+        if (!this.inLooseQueue[o]) {
+          this.inLooseQueue[o] = 1;
+          this.looseQueue.push(o);
+        }
       }
     }
+    this.spreadLoose();
   }
 
   /** 世界じゅうの列を活性化する。起動時の整定に使う。 */
@@ -249,7 +351,7 @@ export class ReposeSystem {
     const H0 = heights[o];
     if (H0 === NO_SURFACE) return 0;
 
-    let budget = H0 - this.floorLimit(o, i, k);
+    let budget = H0 - this.floorLimit(o);
     if (budget <= MIN_MOVE) return 0;
 
     let moved = 0;
@@ -283,30 +385,30 @@ export class ReposeSystem {
 
 
   /**
-   * その列を削ってよい下限 [m]。
+   * その列を削ってよい下限 [m]。空洞の天端には必ず ROOF_KEEP を残す。
    *
-   * 坑道の天端には ROOF_KEEP を残す。ただし守るべきなのは**閉じた空洞**だけ。
-   * ブラシは円筒なので、切土のふちには必ず庇 (オーバーハング) が残り、
-   * その下も「空洞」に見える。これを坑道と同じに守ると、切土のふちが
-   * 厚さ 1 m の庇で凍りついて、法尻に垂直な壁が立ったままになる (実測 83.8 度)。
+   * ここで「横に開いている空洞は坑道ではないので庇ごと削ってよい」という
+   * 例外を持たせてはいけない。一度そう判定すると、削られた列は
+   * 「空洞を持たない低い地面」になって隣の列を同じ判定へ引きずり込む。
+   * 判定が坑道の奥へ**伝染**し、天端が入口から順に剥がされて坑道が空に抜ける。
+   * 実測: 斜面へ 15 m 掘り進んでも土被りが 0 のまま、掘削 1536 m^3 に対して
+   * 6292 m^3 が動き、山腹が 11 m 下がった。隣が「空洞を持たない地面」で
+   * あることを要求しても伝染は止まらない (削られた列がまさにそれになる)。
    *
-   * 見分け方は「横に開いているか」。隣の列の地表がその空洞の天端より低ければ、
-   * その空洞は外へ通じている ＝ 切土そのものであって坑道ではない。
-   * そのときは庇を削り落として、空洞の底 (切土の床) までは下がってよい。
+   * 代わりに払う代償は、切土のふちに残るブラシ由来の庇。円筒ブラシは
+   * 必ずオーバーハングを作るので、そこが厚さ 1 m の板で凍って小さな段になる。
+   * 局所的な見た目の粗であって、掘れなくなるような不具合ではない。
+   *
+   * 「もともと ROOF_KEEP より薄い庇は削ってよい」という逃げ道も置かない。
+   * それも同じ伝染を起こす。薄い天端を削ると、その列は空洞を持たない
+   * 低い地面になり、次の列の天端が薄く見えて、また削られる。坑口の薄い
+   * 天端から順に剥がれて、結局坑道が空に抜ける。
+   * ROOF_KEEP より薄い天端の列は、削れないまま凍る。それでよい。
+   * 天端が薄いこと自体は Tunnel 側が土被りとして読み、必要支保を上げる。
    */
-  private floorLimit(o: number, i: number, k: number): number {
-    const { heights, voidTop, voidBottom } = this.index;
-    const vt = voidTop[o];
-    if (vt === NO_VOID) return 0;
-
-    for (let q = 0; q < NB_N; q++) {
-      const ni = i + NB_DI[q];
-      const nk = k + NB_DK[q];
-      if (isRimColumn(ni, nk)) continue;
-      const hn = heights[ni + nk * NX];
-      if (hn !== NO_SURFACE && hn < vt) return voidBottom[o];
-    }
-    return heights[o] - vt >= ROOF_KEEP ? vt + ROOF_KEEP : vt;
+  private floorLimit(o: number): number {
+    const vt = this.index.voidTop[o];
+    return vt === NO_VOID ? 0 : vt + ROOF_KEEP;
   }
 
   /**
@@ -455,8 +557,9 @@ export class ReposeSystem {
       // 密度場の material は下で書かれるので、次に測り直したときに拾われる。
       cols.push({
         i, k, hOld, hNew, inv,
-        floor: this.floorLimit(o, i, k),
+        floor: this.floorLimit(o),
         geo: (gained ? looseMat[o] : topMat[o]) as Geo,
+        ceil: this.index.lipTop[o],
       });
     }
     this.pendingList.length = 0;

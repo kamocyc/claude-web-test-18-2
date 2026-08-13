@@ -1,5 +1,5 @@
 import {
-  CELL, NX, NY, NZ, Geo, GEO_COUNT,
+  CELL, NX, NY, NZ, Geo, GEO_COUNT, ROOF_KEEP,
   REPOSE_DEG, INSITU_DEG, REPOSE_SATURATED_DROP, WATER_TABLE_Y,
 } from './config';
 import type { VoxelField } from './VoxelField';
@@ -78,6 +78,15 @@ export class HeightIndex {
    * その下で支えているのは岩、というのが正しい。
    */
   readonly looseMat = new Uint8Array(NX * NZ);
+  /**
+   * 地表として採らなかった**薄い庇**の上端 [m]。無ければ heights と同じ。
+   *
+   * 円筒ブラシは切土のふちに必ずオーバーハングを残す。その薄い板を地表と
+   * して採ると、天端を守る規則 (ROOF_KEEP) に引っかかって二度と動かせず、
+   * 実測で高さ 9 m の柱として立ち尽くした。地表は板の**下の地面**で採り、
+   * 板は「その列を削るときにいっしょに削り落とすもの」として覚えておく。
+   */
+  readonly lipTop = new Float64Array(NX * NZ);
 
   constructor() {
     this.voidTop.fill(NO_VOID);
@@ -91,6 +100,7 @@ export class HeightIndex {
     const o = colIdx(i, k);
     if (isRimColumn(i, k)) {
       this.heights[o] = NO_SURFACE;
+      this.lipTop[o] = NO_SURFACE;
       this.voidTop[o] = NO_VOID;
       this.voidBottom[o] = 0;
       this.loose[o] = 0;
@@ -109,25 +119,38 @@ export class HeightIndex {
       if (jh >= 1 && density[base + jh * strideY] <= 0) jTop = jh;
     }
 
-    // 最初の固体を探す。ただし 1 ノードしかない**紙のような庇**は地表として
-    // 採らない。ブラシがえぐった跡にはこれが残ることがあり、地表として採ると
-    // 「厚み 0 の天端」になって、崩しても崩れない列ができてしまう。
+    // 最初の固体を探す。ただし ROOF_KEEP より薄い庇は地表として採らず、
+    // その下の地面まで降りる (上端は lipTop に控える)。
     let j = jTop;
     let idx = base + j * strideY;
+    let lip = -Infinity;
+    const minRun = Math.max(2, Math.ceil(ROOF_KEEP / CELL));
     for (;;) {
       while (j >= 1 && density[idx] <= 0) {
         j--;
         idx -= strideY;
       }
       if (j < 1) break;
-      if (j === 1 || density[idx - strideY] > 0) break;
-      j -= 2;
-      idx -= 2 * strideY;
+      // 固体が何ノード続くか
+      let run = 0;
+      let jr = j;
+      let ir = idx;
+      while (jr >= 1 && density[ir] > 0) {
+        run++;
+        jr--;
+        ir -= strideY;
+      }
+      if (run >= minRun || jr < 1) break;
+      // 薄い庇。上端を覚えて下の地面へ降りる。
+      if (lip === -Infinity) lip = j * CELL + CELL * 0.5;
+      j = jr;
+      idx = ir;
     }
 
     if (j < 1) {
       // 列がまるごと空気。床 (j = 0 は Generator が常に空気) を地面とみなす。
       this.heights[o] = 0;
+      this.lipTop[o] = lip === -Infinity ? 0 : lip;
       this.voidTop[o] = NO_VOID;
       this.voidBottom[o] = 0;
       this.topMat[o] = field.materialAtNode(i, 1, k);
@@ -144,11 +167,15 @@ export class HeightIndex {
       this.heights[o] = j * CELL + (CELL * dSolid) / (dSolid - dAir);
     }
     this.topMat[o] = field.materialAtNode(i, j, k);
+    this.lipTop[o] = lip === -Infinity ? this.heights[o] : lip;
 
     // --- 最上面の下の最初の空洞 (天端と底) ---
+    // j = 0 の床は Generator が常に空気にしているだけで、空洞ではない。
+    // ここを空洞に数えると全列が「天端を持つ列」になり、坑道と地面の
+    // 区別がつかなくなる。
     let jv = j;
     let iv = idx;
-    while (jv >= 1) {
+    while (jv >= 2) {
       jv--;
       iv -= strideY;
       if (density[iv] <= 0) {
@@ -158,7 +185,7 @@ export class HeightIndex {
         // その空洞の底 = 下で地面が戻る高さ
         let jb = jv;
         let ib = iv;
-        while (jb >= 1 && density[ib] <= 0) {
+        while (jb >= 2 && density[ib] <= 0) {
           jb--;
           ib -= strideY;
         }

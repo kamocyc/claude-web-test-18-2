@@ -203,7 +203,7 @@ function frame(): void {
           tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
         }
         // 掘った所は原地盤がゆるむ。急ければこのフレームのうちに崩れる。
-        repose.seedFromEdit(field, res.min, res.max);
+        repose.seedFromEdit(field, res);
         // 掘れば新しい壁面が露出する = そこの地質は分かるようになる
         section.invalidate();
       }
@@ -501,7 +501,7 @@ window.__game = {
       );
       if (res.changed) {
         economy.chargeExcavation(res.volumeByGeo);
-        repose.seedFromEdit(field, res.min, res.max);
+        repose.seedFromEdit(field, res);
       }
     }
     repose.settleNow(field, chunks);
@@ -525,7 +525,7 @@ window.__game = {
       );
       dir.set(b[0] - a[0], b[1] - a[1], b[2] - a[2]).normalize();
       tunnels.recordBore(field, new THREE.Vector3(b[0], b[1], b[2]), dir, radius);
-      repose.seedFromEdit(field, res.min, res.max);
+      repose.seedFromEdit(field, res);
     }
     tunnels.endBore();
     repose.settleNow(field, chunks);

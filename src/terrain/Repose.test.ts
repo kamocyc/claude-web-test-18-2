@@ -253,7 +253,7 @@ describe('崩落の伝播', () => {
     );
     expect(res.changed).toBe(true);
 
-    fx.sys.seedFromEdit(fx.field, res.min, res.max);
+    fx.sys.seedFromEdit(fx.field, res);
     fx.sys.settleNow(fx.field, chunks);
 
     const after = profile(fx.index);
@@ -281,7 +281,7 @@ describe('崩落の伝播', () => {
       cutX, slope(cutX) - 3, 108,
       2.6, 'dig', 0.5, Geo.Soil,
     );
-    fx.sys.seedFromEdit(fx.field, res.min, res.max);
+    fx.sys.seedFromEdit(fx.field, res);
     fx.sys.settleNow(fx.field, chunks);
 
     const got = deg(faceSlope(profile(fx.index)));
@@ -376,7 +376,7 @@ describe('トンネル', () => {
       TX, surf(TX) - 1.2, 40, TX, surf(TX) - 1.2, 88,
       2.6, 'dig', 0.5, Geo.Soil,
     );
-    fx.sys.seedFromEdit(fx.field, res.min, res.max);
+    fx.sys.seedFromEdit(fx.field, res);
     fx.sys.settleNow(fx.field, chunks);
 
     // 坑道の中心線はまだ空気であること
