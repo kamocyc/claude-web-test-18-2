@@ -9,6 +9,7 @@ import type { VoxelField } from '../terrain/VoxelField';
 import type { ChunkManager } from '../terrain/ChunkManager';
 import { SpatialIndex } from './SpatialIndex';
 import { supportDef } from './Support';
+import { Crew, type CrewJob } from './Crew';
 import type { Economy } from './Economy';
 
 /**
@@ -170,7 +171,13 @@ export class TunnelNetwork {
 
   private lastRecord: THREE.Vector3 | null = null;
   /** 施工待ちの列。1 班しかいないので順番に処理する。 */
-  private installQueue: number[] = [];
+  /**
+   * 施工班。既定では自前で持つが、main.ts は法面保護工と**同じ班**を渡す。
+   * 1 班しかいないので、支保と保護工は同じ列に並んで奪い合う。
+   */
+  private crew: Crew = new Crew();
+  /** 区間 → 予約中のジョブ。ETA を引くのに使う。 */
+  private installJobs = new Map<number, CrewJob>();
 
   /** この更新で起きた崩落。演出と警告に使う。 */
   readonly recentCollapses: CollapseEvent[] = [];
@@ -380,13 +387,31 @@ export class TunnelNetwork {
     economy.spend(def.cost);
     seg.installTarget = level;
     seg.installRemaining = def.hours;
-    if (!this.installQueue.includes(seg.id)) this.installQueue.push(seg.id);
+
+    const job: CrewJob = {
+      hours: def.hours,
+      label: def.name,
+      alive: () => !seg.collapsed,
+      finish: () => {
+        seg.installed = seg.installTarget;
+        seg.installRemaining = 0;
+        this.installJobs.delete(seg.id);
+        this.dirtyVisuals = true;
+      },
+    };
+    this.installJobs.set(seg.id, job);
+    this.crew.push(job);
     this.dirtyVisuals = true;
     return true;
   }
 
+  /** 施工班を差し替える。main.ts が法面保護工と共有するために呼ぶ。 */
+  useCrew(crew: Crew): void {
+    this.crew = crew;
+  }
+
   get queueLength(): number {
-    return this.installQueue.length;
+    return this.crew.length;
   }
 
   /**
@@ -398,14 +423,8 @@ export class TunnelNetwork {
    * これを出さないと「効いていないのでは」と思われる。
    */
   installEta(seg: TunnelSegment): number | null {
-    const idx = this.installQueue.indexOf(seg.id);
-    if (idx < 0) return null;
-    let h = 0;
-    for (let i = 0; i <= idx; i++) {
-      const s = this.byId.get(this.installQueue[i]);
-      if (s) h += Math.max(0, s.installRemaining);
-    }
-    return h;
+    const job = this.installJobs.get(seg.id);
+    return job ? this.crew.eta(job) : null;
   }
 
   /**
@@ -453,19 +472,11 @@ export class TunnelNetwork {
 
     if (gameDelta <= 0) return;
 
-    // --- 施工 (1 班なので先頭から順に) ---
-    while (this.installQueue.length > 0) {
-      const seg = this.byId.get(this.installQueue[0]);
-      if (!seg || seg.collapsed) {
-        this.installQueue.shift();
-        continue;
-      }
-      seg.installRemaining -= gameDelta;
-      if (seg.installRemaining > 0) break;
-      seg.installed = seg.installTarget;
-      seg.installRemaining = 0;
-      this.installQueue.shift();
-      this.dirtyVisuals = true;
+    // 施工は Crew が進める (支保と法面保護工で 1 班を共有している)。
+    // リングの色に使う installRemaining はジョブの残り時間から写す。
+    for (const [id, job] of this.installJobs) {
+      const seg = this.byId.get(id);
+      if (seg) seg.installRemaining = job.hours;
     }
 
     // --- 劣化と崩落 ---

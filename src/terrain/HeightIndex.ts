@@ -5,6 +5,14 @@ import {
 import type { VoxelField } from './VoxelField';
 
 /**
+ * 法面保護工が支える角度 [度]。添字は工法のレベル (0 = 無処理)。
+ * 本体の定義は `src/game/SlopeWorks.ts`。角度だけここに写してあるのは、
+ * terrain 層が game 層を import しないため (依存の向きを保つ)。
+ * 値がずれると崩落の角度と表示が食い違うので、SlopeWorks.test.ts で突き合わせる。
+ */
+export const SLOPE_WORK_DEG = [0, 45, 65, 88];
+
+/**
  * 密度場を「列 (x,z) ごとの地表高さ」として読む索引。
  *
  * 安息角の整定はこの 2 次元の高さ場の上で解く。3 次元の場で直接
@@ -54,6 +62,16 @@ function tanTable(table: Record<number, number>): Float64Array {
 const REPOSE_TAN = tanTable(REPOSE_DEG);
 const INSITU_TAN = tanTable(INSITU_DEG);
 
+/**
+ * 法面保護工が支える角度の tan。添字は工法のレベル (0 = 無処理)。
+ * 保護工は構造物なので、地質にも水位にも依存しない。
+ */
+const PROTECT_TAN = (() => {
+  const out = new Float64Array(SLOPE_WORK_DEG.length);
+  for (let i = 0; i < SLOPE_WORK_DEG.length; i++) out[i] = tanOf(SLOPE_WORK_DEG[i]);
+  return out;
+})();
+
 export class HeightIndex {
   /** 最上面の高さ [m]。外周は NO_SURFACE。 */
   readonly heights = new Float64Array(NX * NZ);
@@ -87,6 +105,11 @@ export class HeightIndex {
    * 板は「その列を削るときにいっしょに削り落とすもの」として覚えておく。
    */
   readonly lipTop = new Float64Array(NX * NZ);
+  /**
+   * その列に入っている法面保護工のレベル [0..3]。
+   * 入っていれば、ゆるみ土砂だろうと原地盤だろうとその角度で立つ。
+   */
+  readonly protect = new Uint8Array(NX * NZ);
 
   constructor() {
     this.voidTop.fill(NO_VOID);
@@ -240,6 +263,16 @@ export class HeightIndex {
   reposeTan(o: number): number {
     const g = this.loose[o] > 0 ? this.looseMat[o] : this.topMat[o];
     return REPOSE_TAN[this.heights[o] < WATER_TABLE_Y ? GEO_COUNT + g : g];
+  }
+
+  /** 法面保護工が支える角度の tan。無処理なら 0。 */
+  protectTan(o: number): number {
+    return PROTECT_TAN[this.protect[o]];
+  }
+
+  /** 表示用。その列の保護工が支える角度 [度]。無処理なら 0。 */
+  protectDeg(o: number): number {
+    return SLOPE_WORK_DEG[this.protect[o]];
   }
 
   /** 原地盤が自立できる角度の tan。支えているのは原地盤なので topMat を使う。 */

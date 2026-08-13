@@ -1,4 +1,8 @@
-export type ToolId = 'look' | 'dig' | 'fill' | 'sup1' | 'sup2' | 'sup3' | 'boring' | 'section';
+export type ToolId =
+  | 'look' | 'dig' | 'fill'
+  | 'sup1' | 'sup2' | 'sup3'
+  | 'slope1' | 'slope2' | 'slope3'
+  | 'boring' | 'section';
 
 interface ToolDef {
   id: ToolId;
@@ -7,6 +11,8 @@ interface ToolDef {
   hint: string;
   /** 支保ツールなら設置するレベル。 */
   support?: number;
+  /** 法面保護工ツールなら施工するレベル。 */
+  slope?: number;
 }
 
 const TOOLS: ToolDef[] = [
@@ -16,6 +22,9 @@ const TOOLS: ToolDef[] = [
   { id: 'sup1', label: '木枠', key: 'A', hint: '坑道か警告柱を狙ってドラッグ → 木枠 (L1)。狙った区間の前後 6 m に入る', support: 1 },
   { id: 'sup2', label: '覆工', key: 'S', hint: '坑道か警告柱を狙ってドラッグ → コンクリート覆工 (L2)。狙った区間の前後 6 m に入る', support: 2 },
   { id: 'sup3', label: '鋼製', key: 'D', hint: '坑道か警告柱を狙ってドラッグ → 鋼製支保+排水 (L3)。狙った区間の前後 6 m に入る', support: 3 },
+  { id: 'slope1', label: '吹付', key: 'F', hint: '地表をドラッグして種子吹付 (45°)。塗った所は安息角ではなくこの角度で立つ', slope: 1 },
+  { id: 'slope2', label: '法枠', key: 'G', hint: '地表をドラッグして法枠 (65°)。用地を節約できるが高い', slope: 2 },
+  { id: 'slope3', label: '擁壁', key: 'H', hint: '地表をドラッグして擁壁 (88°)。ほぼ垂直に切れる。いちばん高い', slope: 3 },
   { id: 'boring', label: '調査', key: 'Z', hint: 'クリックでボーリング調査。周囲 9 m の地質が分かる' },
   { id: 'section', label: '断面', key: 'X', hint: '地表をドラッグして断面線を引く。裏付けの無い地質は伏せられる' },
 ];
@@ -23,6 +32,11 @@ const TOOLS: ToolDef[] = [
 /** そのツールが設置する支保レベル。支保ツールでなければ 0。 */
 export function toolSupportLevel(id: ToolId): number {
   return TOOLS.find((t) => t.id === id)?.support ?? 0;
+}
+
+/** そのツールが施工する法面保護工のレベル。保護工ツールでなければ 0。 */
+export function toolSlopeLevel(id: ToolId): number {
+  return TOOLS.find((t) => t.id === id)?.slope ?? 0;
 }
 
 /** 画面下中央のツール選択。キーボードでも切り替えられる。 */

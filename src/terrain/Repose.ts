@@ -152,6 +152,9 @@ export class ReposeSystem {
         // 絶対値なのは盛土のため。置いた土はそれ自体がゆるみ土砂。
         if (hPrev !== NO_SURFACE) {
           const moved = Math.abs(hPrev - heights[o]);
+          // 保護工ごと掘り崩したら効果も消える。これがあるので
+          // 「坑口まわりを塗ってから、その中を掘り抜く」が段取りとして成立する。
+          if (moved > CELL) this.index.protect[o] = 0;
           if (moved > 0) {
             this.index.loosen(o, Math.min(loose[o] + moved, LOOSEN_MAX_DEPTH));
             if (!this.inLooseQueue[o]) {
@@ -356,10 +359,15 @@ export class ReposeSystem {
 
     let moved = 0;
 
+    // 法面保護工が入っていれば、その角度が下限になる。ゆるみ土砂にも
+    // 原地盤にも同じように効く (保護工はその面をその角度で支える構造物なので、
+    // 何が乗っているかとは関係がない)。
+    const guard = this.index.protectTan(o);
+
     // --- 1) ゆるんだ土砂は安息角で流れる。動かせるのはその厚みまで ---
     const looseAvail = Math.min(loose[o], budget);
     if (looseAvail > MIN_MOVE) {
-      const m = this.gather(i, k, this.index.reposeTan(o) * ANISO_CENTER);
+      const m = this.gather(i, k, Math.max(this.index.reposeTan(o), guard) * ANISO_CENTER);
       const got = m > 0 ? this.discharge(o, m, looseAvail, looseMat[o]) : 0;
       if (got > 0) {
         loose[o] = Math.max(0, loose[o] - got);
@@ -375,7 +383,7 @@ export class ReposeSystem {
     // --- 2) 土砂を出し切って原地盤が露出したら、原地盤の角度まで崩れる ---
     // 崩れた分は下流でゆるんだ土砂になる = 崩積土。
     if (loose[o] <= 0 && budget > MIN_MOVE) {
-      const m = this.gather(i, k, this.index.insituTan(o) * ANISO_CENTER);
+      const m = this.gather(i, k, Math.max(this.index.insituTan(o), guard) * ANISO_CENTER);
       const got = m > 0 ? this.discharge(o, m, budget, topMat[o]) : 0;
       if (got > 0) moved += got;
     }

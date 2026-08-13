@@ -4,11 +4,14 @@ import { CameraRig } from './core/CameraRig';
 import { Time } from './core/Time';
 import { Input } from './core/Input';
 import { Hud } from './ui/Hud';
-import { Toolbar, toolSupportLevel, type ToolId } from './ui/Toolbar';
+import { Toolbar, toolSupportLevel, toolSlopeLevel, type ToolId } from './ui/Toolbar';
 import { Alerts } from './ui/Alerts';
 import { TunnelNetwork, type TunnelSegment } from './game/Tunnel';
 import { TunnelView } from './game/TunnelView';
 import { supportName } from './game/Support';
+import { Crew } from './game/Crew';
+import { SlopeWorks, slopeWorkDef, slopeWorkName } from './game/SlopeWorks';
+import { SlopeWorksView } from './game/SlopeWorksView';
 import { SurveySystem, SurveyView, BORING_COST_PER_M, BORING_DEPTH } from './game/Survey';
 import { SectionView } from './ui/SectionView';
 import { VoxelField } from './terrain/VoxelField';
@@ -56,8 +59,13 @@ const tSettle0 = performance.now();
 const heightIndex = new HeightIndex();
 heightIndex.measureAll(field, strata.height);
 const repose = new ReposeSystem(heightIndex);
+// 施工班は 1 班。支保と法面保護工が同じ列に並んで奪い合う。
+const crew = new Crew();
+const slopeWorks = new SlopeWorks(heightIndex, crew);
+const slopeView = new SlopeWorksView();
 repose.seedAll();
 repose.settleNow(field, null);
+tunnels.useCrew(crew);
 const settleMs = performance.now() - tSettle0;
 const settleVol = repose.movedThisSlide;
 
@@ -105,6 +113,7 @@ cursor.setRadius(excavator.radius);
 engine.scene.add(cursor.object);
 engine.scene.add(tunnelView.object);
 engine.scene.add(surveyView.object);
+engine.scene.add(slopeView.object);
 
 // --- カメラ初期位置: 尾根と谷が両方入る俯瞰 ---
 rig.lookAt(
@@ -171,6 +180,7 @@ function frame(): void {
   }
 
   const supLevel = toolSupportLevel(tool);
+  const slopeLevel = toolSlopeLevel(tool);
 
   if (supLevel === 0 && hit) {
     hoverGeo = field.materialAt(hit.point.x, hit.point.y, hit.point.z);
@@ -241,6 +251,16 @@ function frame(): void {
     if (aimSeg) cursor.showAtSegment(aimSeg.pos, aimSeg.dir, aimSeg.radius);
     else if (supLevel > 0) cursor.hide();
 
+    // --- 法面保護工を塗る ---
+    // 崩れてから直すのではなく、掘る前に手当てしておくための道具。
+    // 費用は押した瞬間の前払いで、効くのは施工班の順番が来てから。
+    if (slopeLevel > 0 && input.primaryDown && hit) {
+      if (!slopeWorks.paint(hit.point.x, hit.point.z, excavator.radius, slopeLevel, economy)) {
+        const pv = slopeWorks.preview(hit.point.x, hit.point.z, excavator.radius, slopeLevel);
+        if (pv.cost > economy.money) alerts.flash('資金が足りない');
+      }
+    }
+
     // --- ボーリング調査 ---
     if (tool === 'boring' && input.primaryPressed && hit) {
       const b = survey.start(field, hit.point.x, hit.point.z, economy);
@@ -277,6 +297,11 @@ function frame(): void {
 
   chunks.update(6);
 
+  // --- 施工班 (支保と法面保護工で 1 班) ---
+  // tunnels.update より前に回す。支保が入った結果を同じフレームの
+  // 劣化判定へ渡したい。
+  if (crew.update(time.gameDelta)) slopeWorks.dirtyVisuals = true;
+
   // --- トンネルの評価・施工・劣化・崩落 ---
   tunnels.update(field, chunks, time.gameDelta);
 
@@ -303,6 +328,12 @@ function frame(): void {
   alerts.update(tunnels, time.realDelta);
 
   // --- 調査 ---
+  // 保護工の板は地表に載せているので、崩落で地形が動いたら作り直す
+  if (slopeWorks.dirtyVisuals || slide) {
+    slopeWorks.dirtyVisuals = false;
+    slopeView.rebuild(heightIndex, slopeWorks);
+  }
+
   survey.update(field, time.gameDelta);
   // sync() が dirty を落とすので、その前に拾っておく
   if (survey.dirty) section.invalidate();
@@ -336,12 +367,42 @@ function frame(): void {
         `</span></div>`,
       );
       // 原地盤なら「掘るとここまで寝る」を先に見せる。用地の判断に直結する。
-      if (!si.loose) {
+      const guard = slopeWorks.plannedAt(hit.point.x, hit.point.z);
+      if (guard > 0) {
+        rows.push(
+          `<div class="row"><span class="k">保護工</span>` +
+          `<span class="v">${slopeWorkName(guard)} ${slopeWorkDef(guard)!.deg}°` +
+          (slopeWorks.levelAt(hit.point.x, hit.point.z) < guard ? ' <span style="color:#93a0b4">施工待ち</span>' : '') +
+          `</span></div>`,
+        );
+      } else if (!si.loose) {
         rows.push(
           `<div class="row"><span class="k">掘ると</span>` +
           `<span class="v" style="color:#93a0b4">安息角 ${si.reposeDeg.toFixed(0)}° まで寝る</span></div>`,
         );
       }
+    }
+  }
+
+  // 保護工ツール: 押す前に「いくらで、どれだけ待つか」を出す。
+  // 前払いなので、押してから知るのでは遅い。
+  if (slopeLevel > 0 && hit) {
+    const def = slopeWorkDef(slopeLevel)!;
+    const pv = slopeWorks.preview(hit.point.x, hit.point.z, excavator.radius, slopeLevel);
+    rows.push(
+      `<div class="row"><span class="k">工法</span>` +
+      `<span class="v">${def.name} — ${def.deg}° まで立つ</span></div>`,
+    );
+    rows.push(
+      `<div class="row"><span class="k">この一塗り</span>` +
+      `<span class="v"${pv.cost > economy.money ? ' style="color:#e8705a"' : ''}>` +
+      `${pv.area.toFixed(0)} m² / ¥${Math.round(pv.cost).toLocaleString()}</span></div>`,
+    );
+    if (crew.length > 0) {
+      rows.push(
+        `<div class="row"><span class="k">施工待ち</span>` +
+        `<span class="v">${crew.length} 件 / あと ${Alerts.fmtHours(crew.totalHours)}</span></div>`,
+      );
     }
   }
 
@@ -466,6 +527,8 @@ declare global {
       section: SectionView;
       repose: ReposeSystem;
       heightIndex: HeightIndex;
+      slopeWorks: SlopeWorks;
+      crew: Crew;
       slopeInfoAt: typeof slopeInfoAt;
       THREE: typeof THREE;
       TunnelNetwork: typeof TunnelNetwork;
@@ -484,7 +547,7 @@ declare global {
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
   survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
-  repose, heightIndex, slopeInfoAt,
+  repose, heightIndex, slopeInfoAt, slopeWorks, crew,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
