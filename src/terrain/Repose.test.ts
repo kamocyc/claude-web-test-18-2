@@ -220,6 +220,44 @@ describe('崩落', () => {
     expect(soil).toBeLessThan(weak);
   });
 
+  it('崩れて積もった土は、元が何であれ崩積土 (軟弱層) になる', () => {
+    // 土の段差を崩す。動いた土は土ではなく崩積土として積もる。
+    // ほぐれて積み直された土は元の地山とは別物で、トンネルの埋め戻しと
+    // 同じ扱い (Geo.Weak)。掘り返すと二度目のほうが支保が要る、という
+    // 連鎖がここから自動的に出る。
+    const fx = fixture(step, () => Geo.Soil);
+    const before = Float64Array.from(fx.index.heights);
+    for (let k = 1; k < NZ - 1; k++) {
+      for (let i = 1; i < NX - 1; i++) fx.index.loosen(colIdx(i, k), 20);
+    }
+    fx.sys.seedAll();
+    fx.sys.settleNow(fx.field, chunks);
+
+    // 法尻で 0.5 m 以上積もった列を探し、元の地表より上の節点を見る
+    const kk = NZ >> 1;
+    let found = 0;
+    for (let i = 2; i < NX - 2; i++) {
+      const o = colIdx(i, kk);
+      const rise = fx.index.heights[o] - before[o];
+      if (rise < 0.5) continue;
+      found++;
+      const y = before[o] + rise * 0.5;
+      expect(fx.field.isSolid(i * CELL, y, kk * CELL)).toBe(true);
+      expect(fx.field.materialAt(i * CELL, y, kk * CELL)).toBe(Geo.Weak);
+    }
+    expect(found).toBeGreaterThan(3);
+
+    // 削れて露出した側は元の地質のまま (崩積土になるのは積もった土だけ)
+    let eroded = 0;
+    for (let i = 2; i < NX - 2; i++) {
+      const o = colIdx(i, kk);
+      if (before[o] - fx.index.heights[o] < 0.5) continue;
+      eroded++;
+      expect(fx.field.materialAt(i * CELL, fx.index.heights[o] - 0.5, kk * CELL)).toBe(Geo.Soil);
+    }
+    expect(eroded).toBeGreaterThan(3);
+  });
+
   it('ワールドの外周が崩れない', () => {
     const fx = settleStep(Geo.Soil);
     // 外周の列は地面として測らない = 隣にもならない

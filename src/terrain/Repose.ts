@@ -350,7 +350,7 @@ export class ReposeSystem {
    * @returns 出て行った高さ [m]
    */
   private pourColumn(o: number, i: number, k: number): number {
-    const { heights, loose, looseMat, topMat } = this.index;
+    const { heights, loose } = this.index;
     const H0 = heights[o];
     if (H0 === NO_SURFACE) return 0;
 
@@ -368,7 +368,7 @@ export class ReposeSystem {
     const looseAvail = Math.min(loose[o], budget);
     if (looseAvail > MIN_MOVE) {
       const m = this.gather(i, k, Math.max(this.index.reposeTan(o), guard) * ANISO_CENTER);
-      const got = m > 0 ? this.discharge(o, m, looseAvail, looseMat[o]) : 0;
+      const got = m > 0 ? this.discharge(o, m, looseAvail) : 0;
       if (got > 0) {
         loose[o] = Math.max(0, loose[o] - got);
         moved += got;
@@ -384,7 +384,7 @@ export class ReposeSystem {
     // 崩れた分は下流でゆるんだ土砂になる = 崩積土。
     if (loose[o] <= 0 && budget > MIN_MOVE) {
       const m = this.gather(i, k, Math.max(this.index.insituTan(o), guard) * ANISO_CENTER);
-      const got = m > 0 ? this.discharge(o, m, budget, topMat[o]) : 0;
+      const got = m > 0 ? this.discharge(o, m, budget) : 0;
       if (got > 0) moved += got;
     }
 
@@ -456,7 +456,7 @@ export class ReposeSystem {
    * @param maxAmount 出せる量の上限 [m]。ゆるみ厚や天端までの余裕で決まる。
    * @returns 実際に出した量 [m]
    */
-  private discharge(o: number, m: number, maxAmount: number, mat: number): number {
+  private discharge(o: number, m: number, maxAmount: number): number {
     const { heights, loose, looseMat } = this.index;
     const lam = this.scratchLam;
     const off = this.scratchOff;
@@ -493,8 +493,12 @@ export class ReposeSystem {
       if (got <= 0) continue;
       const no = off[n];
       this.note(no);
-      // 新しく来た土のほうが多ければ、表層の地質はそちらになる
-      if (got > loose[no]) looseMat[no] = mat;
+      // 崩れて運ばれた土は、元が何であれ**崩積土 (軟弱層)** になる。
+      // ほぐれて積み直された土は元の地山とは別物で、トンネルの埋め戻し材
+      // (Tunnel.collapse が Geo.Weak を入れている) と同じ扱いにする。
+      // 表層の地質を書き換えるのは、新しく来た土のほうが多いときだけ。
+      // 薄く乗っただけで岩の急斜面が軟弱層の角度で崩れ出すのを避ける。
+      if (got > loose[no]) looseMat[no] = Geo.Weak;
       heights[no] += got;
       loose[no] += got;
       this.gained[no] = 1;
@@ -541,7 +545,7 @@ export class ReposeSystem {
 
   private writeBack(field: VoxelField, chunks: ChunkManager | null): EditResult | null {
     if (this.pendingList.length === 0) return null;
-    const { heights, looseMat, topMat } = this.index;
+    const { heights, topMat } = this.index;
 
     const cols: ColumnHeightWrite[] = [];
     for (const o of this.pendingList) {
@@ -559,14 +563,17 @@ export class ReposeSystem {
       const gz = (this.h(i, k + 1, hNew) - this.h(i, k - 1, hNew)) / (2 * CELL);
       const inv = 1 / Math.sqrt(1 + gx * gx + gz * gz);
 
-      // 新しく固体になったノードに入れる地質は「運ばれてきた土」のもの。
+      // 新しく固体になったノードは**崩積土 (軟弱層)**。崩れて積み直された土は
+      // 元が土でも岩でも別物なので、色も必要支保も軟弱層として扱う。
+      // 掘り返すと二度目のほうが支保が要る、という連鎖がここから自動的に出る
+      // (トンネルの埋め戻しと同じ筋)。
       // topMat (原地盤の地質) はここでは書き換えない。書き換えると、
-      // 土が薄く乗っただけで岩の崖が土の角度で崩れ出す。
+      // 土が薄く乗っただけで岩の崖が軟弱層の角度で崩れ出す。
       // 密度場の material は下で書かれるので、次に測り直したときに拾われる。
       cols.push({
         i, k, hOld, hNew, inv,
         floor: this.floorLimit(o),
-        geo: (gained ? looseMat[o] : topMat[o]) as Geo,
+        geo: (gained ? Geo.Weak : topMat[o]) as Geo,
         ceil: this.index.lipTop[o],
       });
     }
