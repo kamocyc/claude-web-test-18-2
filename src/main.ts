@@ -17,6 +17,8 @@ import { ChunkManager } from './terrain/ChunkManager';
 import { createTerrainMaterial } from './terrain/TerrainMaterial';
 import { raycastTerrain, overburdenAt, type RayHit } from './terrain/raymarch';
 import { applyCapsule } from './terrain/Edit';
+import { HeightIndex } from './terrain/HeightIndex';
+import { ReposeSystem, slopeInfoAt } from './terrain/Repose';
 import { Economy } from './game/Economy';
 import { Excavator } from './game/Excavator';
 import { BrushCursor } from './game/BrushCursor';
@@ -43,8 +45,21 @@ const section = new SectionView();
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
 const field = new VoxelField();
-generate(field);
+const strata = generate(field);
 const genMs = performance.now() - tGen0;
+
+// --- 安息角: 世界を最初から釣り合った状態にしておく ---
+// 生成直後の地形には、原地盤が自立できる角度より急な所がまだ残っている。
+// 先に均しておかないと「掘っていない所が突然崩れる」ように見える。
+// メッシュ化の前に済ませるので、この整定にメッシュの作り直しは掛からない。
+const tSettle0 = performance.now();
+const heightIndex = new HeightIndex();
+heightIndex.measureAll(field, strata.height);
+const repose = new ReposeSystem(heightIndex);
+repose.seedAll();
+repose.settleNow(field, null);
+const settleMs = performance.now() - tSettle0;
+const settleVol = repose.movedThisSlide;
 
 // デバッグ用: ?mat=normal で法線、?mat=plain で無地。
 // 「格子が見える」原因がジオメトリ側かシェーダ側かを切り分けるために使う。
@@ -61,7 +76,9 @@ chunks.buildAll();
 engine.scene.add(chunks.group);
 
 console.info(
-  `[terrain] generate ${genMs.toFixed(0)}ms, mesh ${chunks.stats.lastRemeshMs.toFixed(0)}ms, ` +
+  `[terrain] generate ${genMs.toFixed(0)}ms, ` +
+  `settle ${settleMs.toFixed(0)}ms (${settleVol.toFixed(0)} m3), ` +
+  `mesh ${chunks.stats.lastRemeshMs.toFixed(0)}ms, ` +
   `${chunks.stats.meshedChunks} chunks, ${chunks.stats.triangles.toFixed(0)} tris, ` +
   `SharedArrayBuffer=${field.shared}`,
 );
@@ -128,6 +145,8 @@ let aimSeg: TunnelSegment | null = null;
 let hoverGeo: Geo = Geo.Soil;
 let hoverDepth = 0;
 let lastCost = 0;
+/** 今の地滑りで動いた土量 [m^3]。崩れ切ったところで 1 回だけ知らせる。 */
+let slideVolume = 0;
 
 function swatch(g: Geo): string {
   const c = GEO_COLOR[g];
@@ -183,6 +202,8 @@ function frame(): void {
         if (tool === 'dig') {
           tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
         }
+        // 掘った所は原地盤がゆるむ。急ければこのフレームのうちに崩れる。
+        repose.seedFromEdit(field, res.min, res.max);
         // 掘れば新しい壁面が露出する = そこの地質は分かるようになる
         section.invalidate();
       }
@@ -234,6 +255,26 @@ function frame(): void {
     }
   }
 
+  // --- 安息角: 急な法面を崩す ---
+  // chunks.update より前に置くので、掘る → 崩れる → 再メッシュ が同じフレームで揃う。
+  // tunnels.update より前に置くのも大事で、崩れて土被りが減ったことを
+  // そのフレームの支保の判定に間に合わせられる (後ろに置くと必ず 1 フレーム遅れる)。
+  // ゲーム内時間ではなく実時間の予算で回すので、時間を止めていても崩れる。
+  const slide = repose.update(field, chunks, 4);
+  if (slide) {
+    tunnels.markDirtyByAABB(
+      slide.min[0], slide.min[1], slide.min[2],
+      slide.max[0], slide.max[1], slide.max[2],
+    );
+    section.invalidate();
+    slideVolume += repose.movedThisSlide;
+  }
+  // 崩れ切ったところで 1 回だけ知らせる。毎フレーム出すと読めない。
+  if (!repose.active && slideVolume > 0) {
+    if (slideVolume > 20) alerts.flash(`法面が崩れた — 土砂 ${slideVolume.toFixed(0)} m³ が動いた`);
+    slideVolume = 0;
+  }
+
   chunks.update(6);
 
   // --- トンネルの評価・施工・劣化・崩落 ---
@@ -254,6 +295,8 @@ function frame(): void {
   for (const c of tunnels.recentCollapses) {
     tunnelView.burst(c.pos, excavator.radius * 1.3);
     alerts.flash(c.daylight ? '崩落 — 地表が陥没した' : '崩落 — 坑道が埋まった');
+    // 陥没孔は垂直に開く。縁が安息角まで寝て漏斗状になる。
+    if (c.daylight) repose.seedAround(c.pos.x, c.pos.z, excavator.radius * 2);
   }
   tunnelView.sync(tunnels);
   tunnelView.update(time.realDelta);
@@ -278,6 +321,30 @@ function frame(): void {
       '</span></div>',
     );
   }
+  // 地面が勝手に動く理由が見えないと、ただ理不尽に感じられる。
+  // 掘る前に「今どれだけ急で、どこまでなら立つのか」を出しておく。
+  if (hit && (tool === 'dig' || tool === 'fill')) {
+    const si = slopeInfoAt(heightIndex, hit.point.x, hit.point.z);
+    if (si) {
+      const limit = si.loose ? si.reposeDeg : si.insituDeg;
+      const over = si.slopeDeg > limit + 1;
+      rows.push(
+        `<div class="row"><span class="k">法面</span><span class="v"` +
+        (over ? ' style="color:#e8b45c"' : '') +
+        `>${si.slopeDeg.toFixed(0)}° / 限界 ${limit.toFixed(0)}°` +
+        (over ? ' 崩れる' : '') +
+        `</span></div>`,
+      );
+      // 原地盤なら「掘るとここまで寝る」を先に見せる。用地の判断に直結する。
+      if (!si.loose) {
+        rows.push(
+          `<div class="row"><span class="k">掘ると</span>` +
+          `<span class="v" style="color:#93a0b4">安息角 ${si.reposeDeg.toFixed(0)}° まで寝る</span></div>`,
+        );
+      }
+    }
+  }
+
   if (excavator.isActive) {
     rows.push(
       `<div class="row"><span class="k">掘進</span><span class="v">${excavator.headSpeed.toFixed(2)} m/s</span></div>`,
@@ -397,6 +464,9 @@ declare global {
       time: Time;
       survey: SurveySystem;
       section: SectionView;
+      repose: ReposeSystem;
+      heightIndex: HeightIndex;
+      slopeInfoAt: typeof slopeInfoAt;
       THREE: typeof THREE;
       TunnelNetwork: typeof TunnelNetwork;
       raycastTerrain: typeof raycastTerrain;
@@ -414,6 +484,7 @@ declare global {
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
   survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
+  repose, heightIndex, slopeInfoAt,
   ready: true,
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
@@ -428,8 +499,12 @@ window.__game = {
         a[0], a[1], a[2], b[0], b[1], b[2],
         radius, 'dig', excavator.blend, Geo.Soil,
       );
-      if (res.changed) economy.chargeExcavation(res.volumeByGeo);
+      if (res.changed) {
+        economy.chargeExcavation(res.volumeByGeo);
+        repose.seedFromEdit(field, res.min, res.max);
+      }
     }
+    repose.settleNow(field, chunks);
     chunks.update(100000);
   },
   bore(path, radius) {
@@ -450,8 +525,10 @@ window.__game = {
       );
       dir.set(b[0] - a[0], b[1] - a[1], b[2] - a[2]).normalize();
       tunnels.recordBore(field, new THREE.Vector3(b[0], b[1], b[2]), dir, radius);
+      repose.seedFromEdit(field, res.min, res.max);
     }
     tunnels.endBore();
+    repose.settleNow(field, chunks);
     chunks.update(100000);
   },
 };
