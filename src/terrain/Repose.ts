@@ -68,7 +68,7 @@ const NB_DIST = NB_DI.map((di, q) => Math.hypot(di, NB_DK[q]) * CELL);
  * 軸方向が最小で対角が最大になる。公称値が最小ではなく**真ん中**に来るよう
  * 全体を縮める。M = 16 で 2cos(pi/16)/(1+cos(pi/16)) = 0.9903。
  */
-const ANISO_CENTER = (2 * Math.cos(Math.PI / NB_N)) / (1 + Math.cos(Math.PI / NB_N));
+export const ANISO_CENTER = (2 * Math.cos(Math.PI / NB_N)) / (1 + Math.cos(Math.PI / NB_N));
 
 export interface ReposeStats {
   sweeps: number;

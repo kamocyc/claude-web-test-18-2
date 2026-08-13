@@ -2,7 +2,7 @@ export type ToolId =
   | 'look' | 'dig' | 'fill'
   | 'sup1' | 'sup2' | 'sup3'
   | 'slope1' | 'slope2' | 'slope3'
-  | 'boring' | 'section';
+  | 'boring' | 'section' | 'align';
 
 interface ToolDef {
   id: ToolId;
@@ -25,6 +25,7 @@ const TOOLS: ToolDef[] = [
   { id: 'slope1', label: '吹付', key: 'F', hint: '地表をドラッグして種子吹付 (45°)。塗った所は安息角ではなくこの角度で立つ', slope: 1 },
   { id: 'slope2', label: '法枠', key: 'G', hint: '地表をドラッグして法枠 (65°)。用地を節約できるが高い', slope: 2 },
   { id: 'slope3', label: '擁壁', key: 'H', hint: '地表をドラッグして擁壁 (88°)。ほぼ垂直に切れる。いちばん高い', slope: 3 },
+  { id: 'align', label: '路線', key: 'R', hint: 'クリックで制御点。規格を満たす中心線が自動で引かれる / Enter 着工 / Backspace 1 点戻す / Esc 取消 / V 規格切替' },
   { id: 'boring', label: '調査', key: 'Z', hint: 'クリックでボーリング調査。周囲 9 m の地質が分かる' },
   { id: 'section', label: '断面', key: 'X', hint: '地表をドラッグして断面線を引く。裏付けの無い地質は伏せられる' },
 ];
