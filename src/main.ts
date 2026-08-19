@@ -13,6 +13,13 @@ import { Crew } from './game/Crew';
 import { SlopeWorks, slopeWorkDef, slopeWorkName } from './game/SlopeWorks';
 import { SlopeWorksView } from './game/SlopeWorksView';
 import { SurveySystem, SurveyView, BORING_COST_PER_M, BORING_DEPTH } from './game/Survey';
+import {
+  buildAlignment, lengthByKind, ROAD_STANDARDS, RoadKind, ROAD_KIND_NAME,
+  type Alignment, type RoadStandard, type Vec2,
+} from './game/Alignment';
+import { planRoad, RoadNetwork, groundHeightAt, terrainProbe, type RoadPlan } from './game/Roadworks';
+import { BridgeNetwork } from './game/Bridge';
+import { RoadView, roadKindCss, describeBridge } from './game/RoadView';
 import { SectionView } from './ui/SectionView';
 import { VoxelField } from './terrain/VoxelField';
 import { generate } from './terrain/Generator';
@@ -20,13 +27,13 @@ import { ChunkManager } from './terrain/ChunkManager';
 import { createTerrainMaterial } from './terrain/TerrainMaterial';
 import { raycastTerrain, overburdenAt, type RayHit } from './terrain/raymarch';
 import { applyCapsule } from './terrain/Edit';
-import { HeightIndex } from './terrain/HeightIndex';
+import { HeightIndex, colIdx, isRimColumn } from './terrain/HeightIndex';
 import { ReposeSystem, slopeInfoAt } from './terrain/Repose';
 import { Economy } from './game/Economy';
 import { Excavator } from './game/Excavator';
 import { BrushCursor } from './game/BrushCursor';
 import {
-  WORLD_X, WORLD_Z, WATER_TABLE_Y, GEO_NAME_JA, GEO_COLOR, Geo,
+  CELL, WORLD_X, WORLD_Z, WATER_TABLE_Y, GEO_NAME_JA, GEO_COLOR, Geo,
 } from './terrain/config';
 
 const container = document.getElementById('app')!;
@@ -66,6 +73,12 @@ const slopeView = new SlopeWorksView();
 repose.seedAll();
 repose.settleNow(field, null);
 tunnels.useCrew(crew);
+
+// --- 道路と橋。施工班は支保・保護工と同じ 1 班を共有する ---
+const bridges = new BridgeNetwork();
+bridges.useCrew(crew);
+const roads = new RoadNetwork(crew);
+const roadView = new RoadView();
 const settleMs = performance.now() - tSettle0;
 const settleVol = repose.movedThisSlide;
 
@@ -114,6 +127,7 @@ engine.scene.add(cursor.object);
 engine.scene.add(tunnelView.object);
 engine.scene.add(surveyView.object);
 engine.scene.add(slopeView.object);
+engine.scene.add(roadView.object);
 
 // --- カメラ初期位置: 尾根と谷が両方入る俯瞰 ---
 rig.lookAt(
@@ -121,12 +135,88 @@ rig.lookAt(
   new THREE.Vector3(WORLD_X * 0.5 - 78, 74, WORLD_Z * 0.5 + 96),
 );
 
+// --- 路線ツールの状態 ---
+// 制御点は「どこを通したいか」であって「どこを通るか」ではない。
+// 規格を満たす中心線は毎回そこから解き直すので、制御点はただの入力として持つ。
+const control: Vec2[] = [];
+let roadStd: RoadStandard = ROAD_STANDARDS[0];
+let alignment: Alignment | null = null;
+let roadPlan: RoadPlan | null = null;
+/**
+ * 制御点か規格が変わったら解き直す。毎フレームやるには重い
+ * (実測 49-91 ms。ほとんどは回廊の展開で、線形そのものは 10 ms 前後)。
+ */
+let alignDirty = false;
+
+const groundAt = (x: number, z: number): number => groundHeightAt(heightIndex, x, z);
+/**
+ * 線形の分類に渡す地形の読み口。
+ * トンネルかどうかは掘る側とまったく同じ述語で答える (`Tunnel.isTunnelCover`)。
+ */
+const probe = terrainProbe(field, heightIndex);
+
+/**
+ * **既知の情報だけ**で地質を読むサンプラ。橋脚の支持力の見積りに使う。
+ *
+ * 見えている地表は定義上すべて露出面なので、地表近くは真の値でよい (§5)。
+ * それより深い所は、ボーリングで裏付けが取れていなければ
+ * 「地表の地質がそのまま下へ続く」という素朴な仮定で答える。
+ * だから未調査の谷では「岩だと思って架けたら軟弱層だった」が起きる。
+ * 着工時は真の場で評価し直すので、そこで深礎が伸びるか、橋脚が立たない。
+ */
+function knownGeoAt(x: number, y: number, z: number): Geo {
+  const gh = groundAt(x, z);
+  if (y > gh - 2) return field.materialAt(x, y, z);
+  if (survey.confidenceAt(x, y, z) >= 0.35) return field.materialAt(x, y, z);
+  const i = Math.round(x / CELL);
+  const k = Math.round(z / CELL);
+  if (isRimColumn(i, k)) return Geo.Soil;
+  return heightIndex.surfaceMat(colIdx(i, k));
+}
+
+const trueGeoAt = (x: number, y: number, z: number): Geo => field.materialAt(x, y, z);
+
+function replanRoad(): void {
+  alignment = control.length >= 2 ? buildAlignment(control, probe, roadStd) : null;
+  roadPlan = alignment
+    ? planRoad(field, heightIndex, alignment, economy, knownGeoAt)
+    : null;
+  roadView.showPreview(alignment, roadPlan, control);
+  alignDirty = false;
+}
+
+function startRoad(): void {
+  if (!roadPlan || !roadPlan.ok || !alignment) {
+    alerts.flash(roadPlan?.problems[0] ?? '制御点を 2 点以上置く');
+    return;
+  }
+  const built = roads.build(
+    field, chunks, heightIndex, repose, tunnels, bridges, economy, roadPlan,
+  );
+  if (!built) {
+    alerts.flash('着工できない');
+    return;
+  }
+  alerts.flash(
+    `着工 — ${alignment.length.toFixed(0)} m / ` +
+    `切土 ${roadPlan.cutVolume.toFixed(0)} m³ / 盛土 ${roadPlan.fillVolume.toFixed(0)} m³`,
+  );
+  roadView.rebuildPaved(roads.roads);
+  section.invalidate();
+  control.length = 0;
+  alignment = null;
+  roadPlan = null;
+  roadView.showPreview(null, null, control);
+}
+
 // --- ツール切り替え ---
 toolbar.onChange = (t: ToolId) => {
   rig.setDigMode(t !== 'look');
   if (t === 'dig' || t === 'fill') excavator.mode = t;
   excavator.end();
   tunnels.endBore();
+  // 路線ツールから離れても検討中の線形は捨てない (掘ってから戻ってこられる)
+  roadView.showPreview(t === 'align' ? alignment : null, roadPlan, t === 'align' ? control : []);
 };
 
 // --- キー ---
@@ -142,6 +232,29 @@ window.addEventListener('keydown', (e) => {
   if (e.key === ']') {
     excavator.radius = Math.min(8, excavator.radius + 0.4);
     cursor.setRadius(excavator.radius);
+  }
+
+  // --- 路線ツール ---
+  if (toolbar.current !== 'align') return;
+  if (e.key === 'Enter') {
+    startRoad();
+  } else if (e.key === 'Backspace') {
+    e.preventDefault();
+    control.pop();
+    alignDirty = true;
+  } else if (e.key === 'Escape') {
+    control.length = 0;
+    alignDirty = true;
+  } else if (e.key === 'v' || e.key === 'V') {
+    // 規格を替えると、同じ制御点でも通る線が変わる。
+    // 曲がれないほうが尾根を切り、谷を跨ぐことになる。
+    const i = ROAD_STANDARDS.indexOf(roadStd);
+    roadStd = ROAD_STANDARDS[(i + 1) % ROAD_STANDARDS.length];
+    alignDirty = true;
+    alerts.flash(
+      `規格 ${roadStd.name} — R ${roadStd.minRadius} m / ` +
+      `勾配 ${(roadStd.maxGrade * 100).toFixed(0)} % / 幅 ${roadStd.width} m`,
+    );
   }
 });
 
@@ -205,7 +318,12 @@ function frame(): void {
         lastCost = economy.chargeExcavation(res.volumeByGeo);
         // 地形が変わった範囲の構造物を再評価キューに積む。
         // 「崩落は後から地面が変わったときだけ」がここで成立する。
+        // 橋も同じ信号で拾う — 橋脚の足元を掘れば支持力が落ちる。
         tunnels.markDirtyByAABB(
+          res.min[0], res.min[1], res.min[2],
+          res.max[0], res.max[1], res.max[2],
+        );
+        bridges.markDirtyByAABB(
           res.min[0], res.min[1], res.min[2],
           res.max[0], res.max[1], res.max[2],
         );
@@ -273,7 +391,17 @@ function frame(): void {
       if (input.primaryPressed && hit) section.setStart(hit.point);
       else if (input.primaryDown && hit) section.setEnd(hit.point);
     }
+
+    // --- 路線 ---
+    // 置くのは「通したい所」だけ。最小曲線半径と最大勾配を満たす中心線は
+    // ここから解き直され、地形との差で区間の種別がひとりでに決まる。
+    if (tool === 'align' && input.primaryPressed && hit) {
+      control.push({ x: hit.point.x, z: hit.point.z });
+      alignDirty = true;
+    }
   }
+
+  if (alignDirty) replanRoad();
 
   // --- 安息角: 急な法面を崩す ---
   // chunks.update より前に置くので、掘る → 崩れる → 再メッシュ が同じフレームで揃う。
@@ -283,6 +411,10 @@ function frame(): void {
   const slide = repose.update(field, chunks, 4);
   if (slide) {
     tunnels.markDirtyByAABB(
+      slide.min[0], slide.min[1], slide.min[2],
+      slide.max[0], slide.max[1], slide.max[2],
+    );
+    bridges.markDirtyByAABB(
       slide.min[0], slide.min[1], slide.min[2],
       slide.max[0], slide.max[1], slide.max[2],
     );
@@ -323,6 +455,28 @@ function frame(): void {
     // 陥没孔は垂直に開く。縁が安息角まで寝て漏斗状になる。
     if (c.daylight) repose.seedAround(c.pos.x, c.pos.z, excavator.radius * 2);
   }
+  // --- 橋: 支持力の再評価・劣化・落橋 ---
+  // トンネルと同じ順序 (施工班のあと、描画の前) に置く。評価は真の場で行う。
+  // 見積りは既知の情報だけで作っているので、ここで初めて食い違いが出る。
+  bridges.update(trueGeoAt, groundAt, time.gameDelta);
+  for (const b of bridges.newlyAtRisk) {
+    alerts.flash(
+      `⚠ 橋脚の支持力が足りない — ${b.plan.type.name} / ` +
+      `あと ${Alerts.fmtHours(BridgeNetwork.hoursToFailure(b))}`,
+    );
+  }
+  for (const c of bridges.recentCollapses) {
+    tunnelView.burst(c.pos, c.bridge.width);
+    alerts.flash('落橋 — 橋脚が沈下した');
+    roadView.rebuildPaved(roads.roads);
+  }
+  roadView.syncBridges(bridges);
+  if (roads.dirtyVisuals) {
+    roads.dirtyVisuals = false;
+    roadView.rebuildPaved(roads.roads);
+  }
+  roadView.update(time.realDelta);
+
   tunnelView.sync(tunnels);
   tunnelView.update(time.realDelta);
   alerts.update(tunnels, time.realDelta);
@@ -490,6 +644,108 @@ function frame(): void {
     }
   }
 
+  // --- 路線ツール: 「規格が地形と何を約束したか」を数字で出す ---
+  // 着工は取り返しがつかない (地形が変わる) ので、押す前に全部見えていること。
+  if (tool === 'align') {
+    rows.push(
+      `<div class="row"><span class="k">規格</span><span class="v">${roadStd.name} — ` +
+      `R ${roadStd.minRadius} m / ${(roadStd.maxGrade * 100).toFixed(0)} % / 幅 ${roadStd.width} m` +
+      `</span></div>`,
+    );
+    if (!alignment || !roadPlan) {
+      rows.push(
+        '<div class="row"><span class="k">制御点</span>' +
+        `<span class="v" style="color:#93a0b4">${control.length} 点 — 2 点以上で線が引ける</span></div>`,
+      );
+    } else {
+      const al = alignment;
+      const pv = roadPlan;
+      const len = lengthByKind(al);
+      rows.push(
+        `<div class="row"><span class="k">延長</span><span class="v">${al.length.toFixed(0)} m ` +
+        `(制御点 ${control.length})</span></div>`,
+      );
+      rows.push(
+        `<div class="row"><span class="k">最小半径</span><span class="v"` +
+        (al.minRadius < roadStd.minRadius * 0.99 ? ' style="color:#e8b45c"' : '') +
+        `>${al.minRadius === Infinity ? '直線' : al.minRadius.toFixed(0) + ' m'}` +
+        (al.maxOffset > 1
+          ? ` <span style="color:#93a0b4">制御点から ${al.maxOffset.toFixed(0)} m</span>`
+          : '') +
+        `</span></div>`,
+      );
+      rows.push(
+        `<div class="row"><span class="k">最大勾配</span>` +
+        `<span class="v">${(al.maxGrade * 100).toFixed(1)} %</span></div>`,
+      );
+      const parts: string[] = [];
+      for (const kind of [RoadKind.Cut, RoadKind.Fill, RoadKind.Tunnel, RoadKind.Bridge]) {
+        if (len[kind] < 1) continue;
+        parts.push(
+          `<span style="color:${roadKindCss(kind)}">${ROAD_KIND_NAME[kind]} ${len[kind].toFixed(0)}</span>`,
+        );
+      }
+      rows.push(
+        `<div class="row"><span class="k">区分 [m]</span>` +
+        `<span class="v">${parts.join(' / ') || '平坦のみ'}</span></div>`,
+      );
+      rows.push(
+        `<div class="row"><span class="k">土工</span><span class="v">切 ${pv.cutVolume.toFixed(0)} / ` +
+        `盛 ${pv.fillVolume.toFixed(0)} m³</span></div>`,
+      );
+      for (const b of pv.bridges) {
+        rows.push(
+          `<div class="row"><span class="k">橋</span><span class="v"` +
+          (b.ok ? '' : ' style="color:#e8705a"') +
+          `>${describeBridge(b)}</span></div>`,
+        );
+        const deep = b.piers.filter((p) => p.foundDepth > 0);
+        if (deep.length > 0) {
+          rows.push(
+            `<div class="row"><span class="k"></span><span class="v" style="color:#93a0b4;font-size:11px">` +
+            `深礎 ${deep.length} 基 / 最大 ${Math.max(...deep.map((p) => p.foundDepth)).toFixed(0)} m</span></div>`,
+          );
+        }
+        // 未調査の所は「地表の地質が下まで続く」と決めてかかった数字なので、
+        // それを隠さない。ここを黙ると、着工してから深礎が伸びる理由が分からない。
+        const unsure = b.piers.filter(
+          (p) => survey.confidenceAt(p.x, p.groundY - 1 - p.foundDepth, p.z) < 0.35,
+        );
+        if (unsure.length > 0) {
+          rows.push(
+            `<div class="row"><span class="k"></span><span class="v" style="color:#e8b45c;font-size:11px">` +
+            `橋脚 ${unsure.length} 基が未調査 — 支持力は推定</span></div>`,
+          );
+        }
+      }
+      rows.push(
+        `<div class="row"><span class="k">工費</span><span class="v"` +
+        (pv.totalCost > economy.money ? ' style="color:#e8705a"' : '') +
+        `>¥${Math.round(pv.totalCost).toLocaleString()}</span></div>`,
+      );
+      rows.push(
+        `<div class="row"><span class="k"></span><span class="v" style="color:#93a0b4;font-size:11px">` +
+        `土工 ${Math.round(pv.earthCost).toLocaleString()} / ` +
+        `トンネル ${Math.round(pv.tunnelCost).toLocaleString()} / ` +
+        `橋 ${Math.round(pv.bridgeCost).toLocaleString()} / ` +
+        `舗装 ${Math.round(pv.paveCost).toLocaleString()}</span></div>`,
+      );
+      if (pv.problems.length > 0) {
+        for (const p of pv.problems) {
+          rows.push(
+            `<div class="row"><span class="k" style="color:#e8705a">×</span>` +
+            `<span class="v" style="color:#e8705a">${p}</span></div>`,
+          );
+        }
+      } else {
+        rows.push(
+          '<div class="row"><span class="k">Enter</span>' +
+          '<span class="v" style="color:#8fd0a0">着工</span></div>',
+        );
+      }
+    }
+  }
+
   if (tool === 'boring') {
     const drilling = survey.borings.filter((b) => !b.done).length;
     rows.push(
@@ -529,6 +785,12 @@ declare global {
       heightIndex: HeightIndex;
       slopeWorks: SlopeWorks;
       crew: Crew;
+      roads: RoadNetwork;
+      bridges: BridgeNetwork;
+      /** テスト用: 制御点を置いて線形を引き、そのまま着工する */
+      road(points: [number, number][], stdId?: string): RoadPlan | null;
+      /** テスト用: 着工せずに見積りだけ返す */
+      previewRoad(points: [number, number][], stdId?: string): RoadPlan | null;
       slopeInfoAt: typeof slopeInfoAt;
       THREE: typeof THREE;
       TunnelNetwork: typeof TunnelNetwork;
@@ -547,8 +809,26 @@ declare global {
 window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
   survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
-  repose, heightIndex, slopeInfoAt, slopeWorks, crew,
+  repose, heightIndex, slopeInfoAt, slopeWorks, crew, roads, bridges,
   ready: true,
+  previewRoad(points, stdId) {
+    control.length = 0;
+    for (const p of points) control.push({ x: p[0], z: p[1] });
+    if (stdId) roadStd = ROAD_STANDARDS.find((s) => s.id === stdId) ?? roadStd;
+    replanRoad();
+    return roadPlan;
+  },
+  road(points, stdId) {
+    control.length = 0;
+    for (const p of points) control.push({ x: p[0], z: p[1] });
+    if (stdId) roadStd = ROAD_STANDARDS.find((s) => s.id === stdId) ?? roadStd;
+    replanRoad();
+    const plan = roadPlan;
+    startRoad();
+    repose.settleNow(field, chunks);
+    chunks.update(100000);
+    return plan;
+  },
   view(from, at) {
     rig.lookAt(new THREE.Vector3(...at), new THREE.Vector3(...from));
   },
