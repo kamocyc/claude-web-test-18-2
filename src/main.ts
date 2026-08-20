@@ -73,7 +73,8 @@ const tSettle0 = performance.now();
 const heightIndex = new HeightIndex();
 heightIndex.measureAll(field, strata.height);
 const repose = new ReposeSystem(heightIndex);
-// 施工班は 1 班。支保と法面保護工が同じ列に並んで奪い合う。
+// 施工班は 1 班。支保・保護工・橋・舗装が同じ口を通る。
+// ただし工期は 0 なので、積まれた仕事は押した瞬間に完成する (Crew.CREW_TIMED)。
 const crew = new Crew();
 const slopeWorks = new SlopeWorks(heightIndex, crew);
 const slopeView = new SlopeWorksView();
@@ -508,7 +509,7 @@ function frame(): void {
 
     // --- 法面保護工を塗る ---
     // 崩れてから直すのではなく、掘る前に手当てしておくための道具。
-    // 費用は押した瞬間の前払いで、効くのは施工班の順番が来てから。
+    // 費用は押した瞬間の前払い。工期 0 なので効くのも押した瞬間。
     if (slopeLevel > 0 && held && hit) {
       if (!slopeWorks.paint(hit.point.x, hit.point.z, excavator.radius, slopeLevel, economy)) {
         const pv = slopeWorks.preview(hit.point.x, hit.point.z, excavator.radius, slopeLevel);
@@ -572,9 +573,10 @@ function frame(): void {
 
   chunks.update(6);
 
-  // --- 施工班 (支保と法面保護工で 1 班) ---
+  // --- 施工班 (支保・保護工・橋・舗装で 1 班) ---
   // tunnels.update より前に回す。支保が入った結果を同じフレームの
-  // 劣化判定へ渡したい。
+  // 劣化判定へ渡したい。工期 0 のいまは列が常に空なので何もしないが、
+  // 工期を戻したときにこの位置でないと 1 フレーム遅れる。
   if (crew.update(time.gameDelta)) slopeWorks.dirtyVisuals = true;
 
   // --- トンネルの評価・施工・劣化・崩落 ---
@@ -773,8 +775,9 @@ function frame(): void {
       }
       const eta = tunnels.installEta(seg);
       if (eta !== null) {
-        // 施工班は 1 班なので順番待ちがある。押した瞬間に金だけ減って
+        // 工期を戻したとき用。順番待ちがあると、押した瞬間に金だけ減って
         // 見た目が変わらないので、いつ入るのかを必ず出す。
+        // 工期 0 のいまは installEta が常に null なのでこの行は出ない。
         rows.push(
           `<div class="row"><span class="k">施工</span>` +
           `<span class="v" style="color:#9fe8ff">${supportName(seg.installTarget)} ` +

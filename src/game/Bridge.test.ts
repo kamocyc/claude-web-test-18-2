@@ -165,11 +165,13 @@ describe('架かったあと', () => {
     return { net, crew };
   };
 
-  it('施工班の順番が来るまで供用しない', () => {
+  it('工期 0 — 架けた瞬間に供用になる', () => {
     const { net, crew } = mkNet(rock, 8);
-    expect(net.bridges[0].built).toBe(false);
-    crew.update(1000);
+    // update を 1 回も回さずに供用済み。橋も工種で例外にしていない。
     expect(net.bridges[0].built).toBe(true);
+    expect(crew.length).toBe(0);
+    // 見積りの工期そのものは残してある (工期を戻すときに使う)
+    expect(net.bridges[0].plan.hours).toBeGreaterThan(0);
   });
 
   it('足元の地質が軟弱層に変わると警告が出て、やがて落橋する', () => {

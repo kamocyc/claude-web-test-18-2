@@ -298,13 +298,15 @@ describe('見積り', () => {
     ).toBeNull();
   });
 
-  it('舗装は施工班の順番が来てから供用になる', () => {
+  it('工期 0 — 舗装は着工した瞬間に供用になる', () => {
     const w = mkWorld(() => 30);
-    const { road } = makeRoad(w, [{ x: 20, z: 64 }, { x: 100, z: 64 }]);
+    const { road, plan } = makeRoad(w, [{ x: 20, z: 64 }, { x: 100, z: 64 }]);
     expect(road).not.toBeNull();
-    expect(road!.paved).toBe(false);
-    w.crew.update(10_000);
+    // update を 1 回も回さずに供用済み
     expect(road!.paved).toBe(true);
+    expect(w.crew.length).toBe(0);
+    // 見積りの工期そのものは残してある (工期を戻すときに使う)
+    expect(plan.hours).toBeGreaterThan(0);
   });
 
   it('規格が違えば土工量も変わる — 曲がれないほうが地形を切る', () => {

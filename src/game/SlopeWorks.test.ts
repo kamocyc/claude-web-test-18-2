@@ -139,27 +139,30 @@ describe('施工', () => {
     return { works: new SlopeWorks(index, crew), crew, index, economy: new Economy() };
   }
 
-  it('費用は前払いで、順番が来るまで効かない', () => {
+  it('工期 0 — 擁壁は押した瞬間に効き、列に残らない', () => {
     const { works, crew, index, economy } = setup();
     const before = economy.money;
     const pv = works.preview(30, 64, 2.6, 3);
     expect(pv.columns).toBeGreaterThan(50);
 
     expect(works.paint(30, 64, 2.6, 3, economy)).toBe(true);
-    // 金は押した瞬間に引かれる
+    // 金は押した瞬間に引かれる (ここは工期 0 でも変わらない)
     expect(before - economy.money).toBeCloseTo(pv.cost, 6);
-    // まだ効いていない
-    expect(index.protect[colIdx(60, 128)]).toBe(0);
-    expect(crew.length).toBe(1);
-
-    // 施工時間の半分では、まだ効かない
-    crew.update(pv.hours * 0.5);
-    expect(index.protect[colIdx(60, 128)]).toBe(0);
-
-    // 使い切ると効く
-    crew.update(pv.hours);
+    // 効くのも押した瞬間。update を 1 回も回していないことに意味がある。
     expect(index.protect[colIdx(60, 128)]).toBe(3);
     expect(crew.length).toBe(0);
+    // 手配済み (未着) の状態がそもそも存在しない
+    expect(works.pending.size).toBe(0);
+    expect(works.plannedAt(30, 64)).toBe(works.levelAt(30, 64));
+  });
+
+  it('時間を止めていても完成する', () => {
+    // 待ち行列で捌いていると、速度 0 では gameDelta が 0 のまま流れない。
+    // 「計画から完成まで 0」を時間の進み方に依存させない。
+    const { works, crew, index, economy } = setup();
+    works.paint(30, 64, 2.6, 3, economy);
+    crew.update(0);
+    expect(index.protect[colIdx(60, 128)]).toBe(3);
   });
 
   it('資金が足りなければ予約できない', () => {
@@ -182,28 +185,36 @@ describe('施工', () => {
     expect(works.paint(30, 64, 2.6, 3, economy)).toBe(true);
   });
 
-  it('施工班は 1 班 — 支保と同じ列に押した順で並ぶ', () => {
+  it('支保と保護工は同じ班を通り、押した順にその場で片付く', () => {
     const { works, crew, economy } = setup();
     const order: string[] = [];
     // 支保のジョブを模して先に積む
     crew.push({ hours: 2, label: '木枠', alive: () => true, finish: () => order.push('支保') });
     works.paint(30, 64, 2.6, 1, economy);
-    const total = crew.totalHours;
-    expect(crew.length).toBe(2);
-
-    // 先に積んだほうが先に終わる
-    crew.update(2.0);
+    // 工期 0 なので取り合いは起きないが、通る口は 1 つのままで順序も保たれる
     expect(order).toEqual(['支保']);
-    crew.update(total);
+    expect(crew.length).toBe(0);
+    expect(crew.totalHours).toBe(0);
+    expect(works.levelAt(30, 64)).toBe(1);
+  });
+
+  it('捨てるジョブは工期 0 でも効かない', () => {
+    // 崩落した区間の支保など。alive() が false なら finish は呼ばれない。
+    const crew = new Crew();
+    let done = false;
+    crew.push({ hours: 1, label: 'dead', alive: () => false, finish: () => { done = true; } });
+    expect(done).toBe(false);
     expect(crew.length).toBe(0);
   });
 
-  it('余った時間は次のジョブへ繰り越す', () => {
-    const crew = new Crew();
+  it('待ち行列そのものは残っている — 余った時間は次のジョブへ繰り越す', () => {
+    // 工期を戻す (CREW_TIMED = true) ときに壊れていないこと。
+    const crew = new Crew(true);
     const done: number[] = [];
     for (let n = 0; n < 4; n++) {
       crew.push({ hours: 0.1, label: `j${n}`, alive: () => true, finish: () => done.push(n) });
     }
+    expect(crew.length).toBe(4);
     // 1 回の update で 4 本とも終わること (1 フレーム 1 本しか進まないと
     // 面積の小さい保護工がいつまでも捌けない)
     crew.update(1.0);

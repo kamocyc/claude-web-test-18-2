@@ -363,7 +363,7 @@ export class BridgeNetwork {
     this.crew = crew;
   }
 
-  /** 施工を始める。費用は前払い、供用は施工班の順番が来てから。 */
+  /** 施工を始める。費用は前払い。工期 0 なので供用も同時 (`Crew`)。 */
   add(plan: BridgePlan, path: THREE.Vector3[], width: number): Bridge {
     const b: Bridge = {
       id: this.nextId++,

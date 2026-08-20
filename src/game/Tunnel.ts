@@ -402,11 +402,10 @@ export class TunnelNetwork {
     this.index.query(minX, minY, minZ, maxX, maxY, maxZ, this.pending);
   }
 
-  /** 施工を予約する。費用は前払い。 */
+  /** 施工を予約する。費用は前払い。工期 0 なので、その場で入る。 */
   queueInstall(seg: TunnelSegment, level: number, economy: Economy): boolean {
     if (seg.collapsed || !seg.isTunnel) return false;
-    // 岩で無支保のまま持つ区間に支保を入れても金と施工班の時間を捨てるだけ。
-    // 1 班しかいないので、無駄な予約は他の区間の崩落に直結する。
+    // 岩で無支保のまま持つ区間に支保を入れても金を捨てるだけ。
     if (seg.required === 0) return false;
     if (seg.installed >= level) return false;
     if (seg.installTarget >= level) return false;
@@ -504,6 +503,7 @@ export class TunnelNetwork {
 
     // 施工は Crew が進める (支保と法面保護工で 1 班を共有している)。
     // リングの色に使う installRemaining はジョブの残り時間から写す。
+    // 工期 0 のいまは push した時点で列が空になるので、ここは空回りする。
     for (const [id, job] of this.installJobs) {
       const seg = this.byId.get(id);
       if (seg) seg.installRemaining = job.hours;
