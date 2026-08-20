@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { GEO_COLOR, Geo, WATER_TABLE_Y } from './config';
+import { CELL, GEO_COLOR, Geo, NX, WATER_TABLE_Y, WORLD_Y } from './config';
 
 /**
  * 地形のマテリアル。
@@ -15,6 +15,9 @@ import { GEO_COLOR, Geo, WATER_TABLE_Y } from './config';
  *  - ディテールノイズの微分から法線を微妙に揺らす (Mikkelsen のバンプ)。
  *    格子と無関係な微細構造が乗るので、残っていた面の切り替わりが見えなくなる。
  *  - 地質は頂点属性 matWeight (土/岩/軟弱の重み) で混色。境界が階段状にならない。
+ *  - 草地は列ごとの被覆率マップ (Vegetation) をワールド XZ で引いて上から重ねる。
+ *    頂点属性にすると再メッシュを通さないと色が変わらないので、掘った所が
+ *    緑のまま残る。テクスチャなら書き換えた次のフレームでそのまま出る。
  */
 
 const VERT_PARS = /* glsl */ `
@@ -42,6 +45,12 @@ uniform float uWaterTableY;
 uniform float uBump;
 uniform float uMacroScale;
 uniform float uDetailScale;
+uniform sampler2D uVegTex;
+uniform float uVegUvScale;
+uniform float uVegUvOffset;
+uniform float uWorldY;
+uniform vec3 uGrassDry;
+uniform vec3 uGrassLush;
 
 float gDetail;
 float gBumpFade;
@@ -112,6 +121,24 @@ float bandAmt = mix( 0.11, 0.04, w.y ) * verticality * verticality;
 
 vec3 col = base * ( 0.74 + 0.52 * gDetail ) * ( 1.0 - bandAmt + bandAmt * 2.0 * band );
 
+// --- 草地 ---
+// R = 被覆率、G = その列の地表高さ / uWorldY。
+// 上を向いた面「かつ」地表のすぐ近くにだけ乗せる。上向きだけで判定すると
+// 坑道の床 (法線はほぼ真上) が緑になる。切土の壁と天端も、法線と深さの
+// どちらかで必ず落ちる。
+vec2 vegUv = vWPos.xz * uVegUvScale + uVegUvOffset;
+vec2 vegSample = texture2D( uVegTex, vegUv ).rg;
+float upFace = smoothstep( 0.45, 0.86, vWNormal.y );
+float nearSurf = 1.0 - smoothstep( 0.25, 1.20, vegSample.g * uWorldY - vWPos.y );
+// 被覆率をそのまま混色比にすると、木が立つ程度 (0.4) の所がまだ土色のままで、
+// 「裸地に木が生えている」絵になる。薄い所を持ち上げてから混ぜる。
+float vegAmt = pow( vegSample.r, 0.62 ) * upFace * nearSurf;
+if ( vegAmt > 0.001 ) {
+  vec3 grass = mix( uGrassDry, uGrassLush, clamp( macro * 1.35, 0.0, 1.0 ) );
+  // 土の起伏をそのまま草にも通す。平坦な緑を貼ると地形が板に見える。
+  col = mix( col, grass * ( 0.76 + 0.46 * gDetail ), vegAmt );
+}
+
 // 地下水位より下は暗く湿らせる。企画の「水平な一本の線」はこれだけで読める。
 float wet = smoothstep( uWaterTableY + 0.4, uWaterTableY - 0.4, vWPos.y );
 col = mix( col, col * vec3( 0.44, 0.52, 0.60 ), wet * 0.72 );
@@ -147,6 +174,13 @@ export interface TerrainMaterialHandle {
   uniforms: Record<string, THREE.IUniform>;
 }
 
+/** 被覆率マップが差し込まれるまでの代わり。1 テクセルの裸地。 */
+function emptyVegTexture(): THREE.DataTexture {
+  const t = new THREE.DataTexture(new Uint8Array(new ArrayBuffer(2)), 1, 1, THREE.RGFormat);
+  t.needsUpdate = true;
+  return t;
+}
+
 export function createTerrainMaterial(): TerrainMaterialHandle {
   const uniforms: Record<string, THREE.IUniform> = {
     uSoil: { value: new THREE.Color(...GEO_COLOR[Geo.Soil]) },
@@ -157,6 +191,14 @@ export function createTerrainMaterial(): TerrainMaterialHandle {
     // 格子 (0.5 m) と揃わない周期にするのが肝
     uMacroScale: { value: 1 / 3.7 },
     uDetailScale: { value: 1 / 1.13 },
+    // 被覆率マップは Vegetation が持つ。差し込まれるまでは全部ゼロ (= 裸地)。
+    uVegTex: { value: emptyVegTexture() },
+    // ノード (i,k) はワールド (i*CELL, k*CELL) にあるので、テクセル中心へ半歩ずらす
+    uVegUvScale: { value: 1 / (CELL * NX) },
+    uVegUvOffset: { value: 0.5 / NX },
+    uWorldY: { value: WORLD_Y },
+    uGrassDry: { value: new THREE.Color(0.34, 0.38, 0.17) },
+    uGrassLush: { value: new THREE.Color(0.18, 0.34, 0.12) },
   };
 
   const material = new THREE.MeshStandardMaterial({
@@ -179,7 +221,7 @@ export function createTerrainMaterial(): TerrainMaterialHandle {
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>\n${FRAG_BUMP}`);
   };
 
-  material.customProgramCacheKey = () => 'terrain-triplanar-v1';
+  material.customProgramCacheKey = () => 'terrain-triplanar-v2';
 
   return { material, uniforms };
 }

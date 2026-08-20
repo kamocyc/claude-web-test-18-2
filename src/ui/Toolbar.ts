@@ -46,6 +46,14 @@ export class Toolbar {
   private buttons = new Map<ToolId, HTMLElement>();
   private _current: ToolId = 'look';
   onChange: (t: ToolId) => void = () => {};
+  /**
+   * 文字キーで道具を持ち替えられるか。
+   * 一人称では WASD が移動に要るので切る (W で掘る道具に変わったら歩けない)。
+   * 代わりにホイールで送る。
+   */
+  hotkeys = true;
+  /** 視点モードごとの操作説明。ヘルプの先頭に足す。 */
+  modeHelp = '';
 
   constructor() {
     this.root = document.createElement('div');
@@ -82,6 +90,7 @@ export class Toolbar {
     }
 
     window.addEventListener('keydown', (e) => {
+      if (!this.hotkeys) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const t = TOOLS.find((x) => x.key.toLowerCase() === e.key.toLowerCase());
       if (t) this.select(t.id);
@@ -92,6 +101,18 @@ export class Toolbar {
 
   get current(): ToolId {
     return this._current;
+  }
+
+  /** 隣の道具へ送る。一人称のホイール持ち替え。 */
+  cycle(dir: number): void {
+    const i = TOOLS.findIndex((t) => t.id === this._current);
+    const n = TOOLS.length;
+    this.select(TOOLS[(i + (dir > 0 ? 1 : n - 1)) % n].id);
+  }
+
+  /** 視点モードが変わったらヘルプを書き直す。 */
+  refreshHelp(): void {
+    this.refresh();
   }
 
   select(id: ToolId): void {
@@ -106,7 +127,10 @@ export class Toolbar {
     const t = TOOLS.find((x) => x.id === this._current)!;
     const help = document.getElementById('help');
     if (help) {
-      help.innerHTML = `<b>${t.label}</b> — ${t.hint}<br><b>ホイール</b> ズーム / <b>[ ]</b> ブラシ半径 / <b>0-3</b> 時間速度`;
+      help.innerHTML =
+        `<b>${t.label}</b> — ${t.hint}<br>` +
+        (this.modeHelp ? `${this.modeHelp}<br>` : '') +
+        '<b>[ ]</b> ブラシ半径 / <b>0-3</b> 時間速度 / <b>Tab</b> 視点切替';
     }
   }
 }

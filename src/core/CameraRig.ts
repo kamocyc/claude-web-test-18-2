@@ -10,6 +10,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 export class CameraRig {
   readonly controls: OrbitControls;
   private digMode = false;
+  private enabled = true;
 
   constructor(camera: THREE.PerspectiveCamera, dom: HTMLElement) {
     this.controls = new OrbitControls(camera, dom);
@@ -36,6 +37,16 @@ export class CameraRig {
     return this.digMode;
   }
 
+  /**
+   * 一人称に入っている間は止める。
+   * 止めないと、同じカメラを毎フレーム両方が書きに来て、
+   * 減衰の残りが一人称の視点をじわじわ引っぱる。
+   */
+  setEnabled(on: boolean): void {
+    this.enabled = on;
+    this.controls.enabled = on;
+  }
+
   lookAt(target: THREE.Vector3, from: THREE.Vector3): void {
     this.controls.target.copy(target);
     this.controls.object.position.copy(from);
@@ -43,6 +54,7 @@ export class CameraRig {
   }
 
   update(): void {
+    if (!this.enabled) return;
     this.controls.update();
   }
 }

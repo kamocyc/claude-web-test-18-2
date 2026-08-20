@@ -1,11 +1,13 @@
 import * as THREE from 'three';
-import { Engine } from './core/Engine';
+import { Engine, type ViewMode } from './core/Engine';
 import { CameraRig } from './core/CameraRig';
+import { FirstPerson } from './core/FirstPerson';
 import { Time } from './core/Time';
 import { Input } from './core/Input';
 import { Hud } from './ui/Hud';
 import { Toolbar, toolSupportLevel, toolSlopeLevel, type ToolId } from './ui/Toolbar';
 import { Alerts } from './ui/Alerts';
+import { ViewUi } from './ui/ViewUi';
 import { TunnelNetwork, type TunnelSegment } from './game/Tunnel';
 import { TunnelView } from './game/TunnelView';
 import { supportName } from './game/Support';
@@ -32,6 +34,9 @@ import { ReposeSystem, slopeInfoAt } from './terrain/Repose';
 import { Economy } from './game/Economy';
 import { Excavator } from './game/Excavator';
 import { BrushCursor } from './game/BrushCursor';
+import { REACH } from './game/Player';
+import { Vegetation } from './terrain/Vegetation';
+import { VegetationView } from './game/VegetationView';
 import {
   CELL, WORLD_X, WORLD_Z, WATER_TABLE_Y, GEO_NAME_JA, GEO_COLOR, Geo,
 } from './terrain/config';
@@ -51,6 +56,8 @@ const alerts = new Alerts();
 const survey = new SurveySystem();
 const surveyView = new SurveyView();
 const section = new SectionView();
+const viewUi = new ViewUi();
+const fp = new FirstPerson(engine.camera, engine.canvas);
 
 // --- 地形の生成とメッシュ化 ---
 const tGen0 = performance.now();
@@ -74,6 +81,12 @@ repose.seedAll();
 repose.settleNow(field, null);
 tunnels.useCrew(crew);
 
+// --- 植生。整定が済んで地表が確定してから種を撒く ---
+// 先に撒くと、生成直後に残っていた急斜面ぶんだけ緑が余分に付き、
+// 最初の整定でそれが一斉に剥がれる (何もしていないのに山が禿げる)。
+const vegetation = new Vegetation();
+vegetation.seedAll(heightIndex);
+
 // --- 道路と橋。施工班は支保・保護工と同じ 1 班を共有する ---
 const bridges = new BridgeNetwork();
 bridges.useCrew(crew);
@@ -84,7 +97,12 @@ const settleVol = repose.movedThisSlide;
 
 // デバッグ用: ?mat=normal で法線、?mat=plain で無地。
 // 「格子が見える」原因がジオメトリ側かシェーダ側かを切り分けるために使う。
-const matParam = new URLSearchParams(location.search).get('mat');
+const params = new URLSearchParams(location.search);
+const matParam = params.get('mat');
+/** ?veg=0 で植生を切る。「緑が地質を隠していないか」を見比べるため。 */
+const vegOn = params.get('veg') !== '0';
+/** ?shadows=0 で木の影を切る。フレーム時間の実測用。 */
+const shadowsOn = params.get('shadows') !== '0';
 const terrainMat = createTerrainMaterial();
 const debugMat =
   matParam === 'normal'
@@ -92,6 +110,9 @@ const debugMat =
     : matParam === 'plain'
       ? new THREE.MeshStandardMaterial({ color: 0xa08363, roughness: 0.95 })
       : null;
+// 草地の色は地形シェーダが被覆率マップから引く。頂点属性ではないので、
+// 掘って被覆率が落ちた列は再メッシュを待たずにその場で土の色へ戻る。
+if (vegOn) terrainMat.uniforms.uVegTex.value = vegetation.maskTexture;
 const chunks = new ChunkManager(field, debugMat ?? terrainMat.material);
 chunks.buildAll();
 engine.scene.add(chunks.group);
@@ -120,6 +141,12 @@ waterPlane.position.set(WORLD_X / 2, WATER_TABLE_Y, WORLD_Z / 2);
 waterPlane.renderOrder = 2;
 engine.scene.add(waterPlane);
 
+// --- 木と草 ---
+const vegView = new VegetationView();
+if (vegOn) engine.scene.add(vegView.object);
+// 影を落とすのは木だけ。範囲は世界ちょうどを覆う直交カメラ 1 枚で足りる。
+if (shadowsOn) engine.configureSun(new THREE.Vector3(WORLD_X / 2, 20, WORLD_Z / 2), 100);
+
 // --- ブラシカーソル ---
 const cursor = new BrushCursor();
 cursor.setRadius(excavator.radius);
@@ -134,6 +161,77 @@ rig.lookAt(
   new THREE.Vector3(WORLD_X * 0.5, 22, WORLD_Z * 0.5),
   new THREE.Vector3(WORLD_X * 0.5 - 78, 74, WORLD_Z * 0.5 + 96),
 );
+
+// --- 視点モード ---
+// 俯瞰と一人称は**同じカメラを排他で**使う。両方が毎フレーム書きに来ると、
+// OrbitControls の減衰の残りが一人称の視点を引っぱる。
+//
+// 一人称で変わるのは 3 つだけで、それ以外の道具の処理は俯瞰とまったく同じ経路を通る。
+//   1. 狙いが画面中央に固定される (ポインタロック)
+//   2. 届く距離が 4.5 m になる (`REACH`)
+//   3. ブラシ半径の上限が 1.8 m になる (腕の届く仕事の大きさ)
+let viewMode: ViewMode = 'orbit';
+const FP_BRUSH_MAX = 1.8;
+const ORBIT_BRUSH_MAX = 8;
+
+const ORBIT_HELP = '<b>左ドラッグ</b> 回転 / <b>右ドラッグ</b> 平行移動 / <b>ホイール</b> ズーム';
+const FP_HELP =
+  '<b>WASD</b> 移動 / <b>Space</b> 跳ぶ / <b>Shift</b> 走る / ' +
+  '<b>ホイール</b> 道具の持ち替え / 届くのは正面 4.5 m まで';
+
+function brushMax(): number {
+  return viewMode === 'fp' ? FP_BRUSH_MAX : ORBIT_BRUSH_MAX;
+}
+
+function setBrushRadius(r: number): void {
+  excavator.radius = Math.max(1.2, Math.min(brushMax(), r));
+  cursor.setRadius(excavator.radius);
+}
+
+function setViewMode(mode: ViewMode): void {
+  if (mode === viewMode) return;
+  viewMode = mode;
+  excavator.end();
+  tunnels.endBore();
+  engine.setViewMode(mode);
+  input.centered = mode === 'fp';
+  toolbar.hotkeys = mode !== 'fp';
+  toolbar.modeHelp = mode === 'fp' ? FP_HELP : ORBIT_HELP;
+  toolbar.refreshHelp();
+
+  if (mode === 'fp') {
+    rig.setEnabled(false);
+    // 今の注視点の真下に立たせる。俯瞰で見ていた場所へそのまま降りられる。
+    fp.enter(field, rig.controls.target.x, rig.controls.target.z);
+    setBrushRadius(excavator.radius);
+  } else {
+    fp.exit();
+    rig.setEnabled(true);
+    // 立っていた所を見下ろす位置に戻す。俯瞰へ戻った瞬間に
+    // まったく別の場所を見ていると、さっきまで居た所を探す羽目になる。
+    const p = fp.player.pos;
+    rig.lookAt(
+      new THREE.Vector3(p.x, p.y + 2, p.z),
+      new THREE.Vector3(p.x - 30, p.y + 38, p.z + 40),
+    );
+  }
+  viewUi.setMode(mode);
+  viewUi.setLocked(fp.locked);
+}
+
+viewUi.onToggle = () => setViewMode(viewMode === 'fp' ? 'orbit' : 'fp');
+// 一人称では WASD が塞がるので、道具の持ち替えはホイールで送る。
+fp.onWheel = (d) => toolbar.cycle(d);
+// Esc やタブ切替でロックが外れた瞬間の mouseup は拾えない。
+// 落としておかないと、押しっぱなし扱いのまま掘り続ける。
+fp.onUnlock = () => input.clear();
+// ポインタロックはクリックでしか取れない。掴めていない間は道具も動かないので、
+// このクリックでいきなり地面を掘ることにはならない。
+engine.canvas.addEventListener('pointerdown', () => {
+  if (viewMode === 'fp') fp.requestLock();
+});
+toolbar.modeHelp = ORBIT_HELP;
+toolbar.refreshHelp();
 
 // --- 路線ツールの状態 ---
 // 制御点は「どこを通したいか」であって「どこを通るか」ではない。
@@ -202,6 +300,13 @@ function startRoad(): void {
     `切土 ${roadPlan.cutVolume.toFixed(0)} m³ / 盛土 ${roadPlan.fillVolume.toFixed(0)} m³`,
   );
   roadView.rebuildPaved(roads.roads);
+  // 路面の列は緑を止める。切土・盛土なら地表が動くので勝手に剥がれるが、
+  // 平坦地をそのまま通した区間は高さが動かないので、ここで印を付けないと
+  // 舗装の下から草が生える。
+  for (const st of alignment.stations) {
+    if (st.kind === RoadKind.Tunnel || st.kind === RoadKind.Bridge) continue;
+    vegetation.paveDisc(st.x, st.z, alignment.std.width * 0.5);
+  }
   section.invalidate();
   control.length = 0;
   alignment = null;
@@ -221,18 +326,18 @@ toolbar.onChange = (t: ToolId) => {
 
 // --- キー ---
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') {
+    // ブラウザのフォーカス送りを止める。押した瞬間に視点が入れ替わる。
+    e.preventDefault();
+    setViewMode(viewMode === 'fp' ? 'orbit' : 'fp');
+    return;
+  }
   if (e.key === '0') time.speed = 0;
   if (e.key === '1') time.speed = 1;
   if (e.key === '2') time.speed = 2;
   if (e.key === '3') time.speed = 4;
-  if (e.key === '[') {
-    excavator.radius = Math.max(1.2, excavator.radius - 0.4);
-    cursor.setRadius(excavator.radius);
-  }
-  if (e.key === ']') {
-    excavator.radius = Math.min(8, excavator.radius + 0.4);
-    cursor.setRadius(excavator.radius);
-  }
+  if (e.key === '[') setBrushRadius(excavator.radius - 0.4);
+  if (e.key === ']') setBrushRadius(excavator.radius + 0.4);
 
   // --- 路線ツール ---
   if (toolbar.current !== 'align') return;
@@ -281,16 +386,44 @@ function swatch(g: Geo): string {
 function frame(): void {
   requestAnimationFrame(frame);
   time.tick();
-  rig.update();
+
+  // --- 視点 ---
+  // 歩くのは実時間で回す。整定 (repose) と同じ理屈で、時間を止めていても
+  // 崩れた所を見に行けないと判断の材料にならない。
+  const fpv = viewMode === 'fp';
+  if (fpv) fp.update(field, time.realDelta);
+  else rig.update();
+  viewUi.setLocked(fp.locked);
+
+  // 坑内の灯り。地表が頭より上にある = 山の中に居る、で点ける。
+  // 「入ったら点く」を条件で決めておくと、坑口を抜ける瞬間に自然に切り替わる。
+  {
+    const p = fp.player.pos;
+    const underground = fpv && groundAt(p.x, p.z) > p.y + 2.4;
+    const want = underground ? 11 : 0;
+    engine.headlamp.intensity += (want - engine.headlamp.intensity) * Math.min(1, time.realDelta * 5);
+    if (engine.headlamp.intensity > 0.01) engine.headlamp.position.copy(engine.camera.position);
+  }
 
   const tool = toolbar.current;
   let hit: RayHit | null = null;
+  // 一人称は視点を掴んでいる間だけ道具が動く。掴むためのクリックで
+  // いきなり地面を掘らないための蓋でもある。
+  const aiming = fpv ? fp.locked : input.inside;
+  const pressed = aiming && input.primaryPressed;
+  const held = aiming && input.primaryDown;
 
-  if (tool !== 'look' && input.inside) {
+  if (tool !== 'look' && aiming) {
     input.rayOrigin(engine.camera, rayOrigin);
     input.rayDirection(engine.camera, rayDir);
-    hit = raycastTerrain(field, rayOrigin, rayDir);
+    // 一人称で届くのは正面 REACH まで。ここ 1 行が「すぐ前にあるものしか
+    // 扱えない」の全部で、道具の側には一切手を入れていない。
+    hit = raycastTerrain(field, rayOrigin, rayDir, fpv ? REACH : 400);
+    // 目が壁にめり込むと距離 0 のヒットが返る (raycastTerrain の起点が固体の分岐)。
+    // そのまま渡すと自分の足元を掘る。
+    if (hit && hit.distance < 0.15) hit = null;
   }
+  if (fpv) viewUi.setAim(hit !== null);
 
   const supLevel = toolSupportLevel(tool);
   const slopeLevel = toolSlopeLevel(tool);
@@ -305,8 +438,8 @@ function frame(): void {
 
   // --- 掘削の開始 / 継続 / 終了 ---
   if (tool === 'dig' || tool === 'fill') {
-    if (input.primaryPressed && hit) excavator.begin(hit, rayDir);
-    if (!input.primaryDown && excavator.isActive) {
+    if (pressed && hit) excavator.begin(hit, rayDir);
+    if (!held && excavator.isActive) {
       excavator.end();
       tunnels.endBore();
     }
@@ -327,6 +460,7 @@ function frame(): void {
           res.min[0], res.min[1], res.min[2],
           res.max[0], res.max[1], res.max[2],
         );
+        vegetation.markDirtyByAABB(res.min[0], res.min[2], res.max[0], res.max[2]);
         if (tool === 'dig') {
           tunnels.recordBore(field, excavator.headPosition, rayDir, excavator.radius);
         }
@@ -348,11 +482,14 @@ function frame(): void {
     if (supLevel > 0) {
       input.rayOrigin(engine.camera, rayOrigin);
       input.rayDirection(engine.camera, rayDir);
-      aimSeg = input.inside
+      aimSeg = aiming
         ? tunnels.nearestToRay(rayOrigin, rayDir, excavator.radius * 1.6, supLevel)
         : null;
+      // 一人称では手の届く区間だけ。坑道の中で正面の 1 リングを狙う道具になる。
+      // 少し甘く (REACH の 2 倍) しているのは、掘進中は切羽の手前を狙うため。
+      if (aimSeg && fpv && aimSeg.pos.distanceTo(rayOrigin) > REACH * 2) aimSeg = null;
 
-      if (aimSeg && input.primaryDown) {
+      if (aimSeg && held) {
         // 狙った区間を中心に、その前後をまとめて予約する (なぞって塗れるように)
         const targets = tunnels.within(aimSeg.pos, excavator.radius * 2.2, []);
         for (const seg of targets) {
@@ -372,7 +509,7 @@ function frame(): void {
     // --- 法面保護工を塗る ---
     // 崩れてから直すのではなく、掘る前に手当てしておくための道具。
     // 費用は押した瞬間の前払いで、効くのは施工班の順番が来てから。
-    if (slopeLevel > 0 && input.primaryDown && hit) {
+    if (slopeLevel > 0 && held && hit) {
       if (!slopeWorks.paint(hit.point.x, hit.point.z, excavator.radius, slopeLevel, economy)) {
         const pv = slopeWorks.preview(hit.point.x, hit.point.z, excavator.radius, slopeLevel);
         if (pv.cost > economy.money) alerts.flash('資金が足りない');
@@ -380,7 +517,7 @@ function frame(): void {
     }
 
     // --- ボーリング調査 ---
-    if (tool === 'boring' && input.primaryPressed && hit) {
+    if (tool === 'boring' && pressed && hit) {
       const b = survey.start(field, hit.point.x, hit.point.z, economy);
       if (!b) alerts.flash('調査を開始できない (資金不足)');
       else section.invalidate();
@@ -388,14 +525,14 @@ function frame(): void {
 
     // --- 断面線 ---
     if (tool === 'section') {
-      if (input.primaryPressed && hit) section.setStart(hit.point);
-      else if (input.primaryDown && hit) section.setEnd(hit.point);
+      if (pressed && hit) section.setStart(hit.point);
+      else if (held && hit) section.setEnd(hit.point);
     }
 
     // --- 路線 ---
     // 置くのは「通したい所」だけ。最小曲線半径と最大勾配を満たす中心線は
     // ここから解き直され、地形との差で区間の種別がひとりでに決まる。
-    if (tool === 'align' && input.primaryPressed && hit) {
+    if (tool === 'align' && pressed && hit) {
       control.push({ x: hit.point.x, z: hit.point.z });
       alignDirty = true;
     }
@@ -418,6 +555,7 @@ function frame(): void {
       slide.min[0], slide.min[1], slide.min[2],
       slide.max[0], slide.max[1], slide.max[2],
     );
+    vegetation.markDirtyByAABB(slide.min[0], slide.min[2], slide.max[0], slide.max[2]);
     section.invalidate();
     slideVolume += repose.movedThisSlide;
   }
@@ -426,6 +564,11 @@ function frame(): void {
     if (slideVolume > 20) alerts.flash(`法面が崩れた — 土砂 ${slideVolume.toFixed(0)} m³ が動いた`);
     slideVolume = 0;
   }
+
+  // 地形が動くのはここまで。掘って足元が消えた・崩落に埋められたのを、
+  // 絵を出す前に同じフレームのうちに解く。1 フレーム遅らせると、
+  // 埋まった瞬間の画がそのまま出てしまう。
+  if (fpv) fp.player.resolve(field);
 
   chunks.update(6);
 
@@ -486,6 +629,18 @@ function frame(): void {
   if (slopeWorks.dirtyVisuals || slide) {
     slopeWorks.dirtyVisuals = false;
     slopeView.rebuild(heightIndex, slopeWorks);
+  }
+
+  // --- 植生 ---
+  // 施工班 (crew) のあとに置く。種子吹付が入った列をその場で生え戻りへ回せる。
+  // 整定より後でもあるので、崩れた列は同じフレームで裸になる。
+  vegetation.update(heightIndex, time.gameDelta);
+  if (vegOn) {
+    // 草の房を実体で持つのは足元だけ。俯瞰で引いているときは 1 本も持たない
+    // (1 本が 1 画素未満になる)。遠景の緑は被覆率マップの色が受け持つ。
+    const close = fpv || engine.camera.position.distanceTo(rig.controls.target) < 45;
+    vegView.sync(vegetation, heightIndex, fpv ? fp.player.pos : rig.controls.target, close);
+    vegView.update(time.realDelta);
   }
 
   survey.update(field, time.gameDelta);
@@ -758,6 +913,19 @@ function frame(): void {
     );
   }
 
+  if (fpv) {
+    const p = fp.player.pos;
+    rows.push(
+      `<div class="row"><span class="k">現在地</span><span class="v">` +
+      `${p.x.toFixed(0)}, ${p.z.toFixed(0)} / 標高 ${p.y.toFixed(1)} m</span></div>`,
+    );
+    if (tool !== 'look' && !hit) {
+      rows.push(
+        '<div class="row"><span class="k">正面</span>' +
+        `<span class="v" style="color:#93a0b4">${REACH} m 以内に地面が無い</span></div>`,
+      );
+    }
+  }
   rows.push(`<div class="row"><span class="k">ブラシ</span><span class="v">R ${excavator.radius.toFixed(1)} m</span></div>`);
   hud.update(time, chunks.stats, rows.join(''));
 
@@ -787,6 +955,12 @@ declare global {
       crew: Crew;
       roads: RoadNetwork;
       bridges: BridgeNetwork;
+      fp: FirstPerson;
+      vegetation: Vegetation;
+      /** テスト用: 視点を切り替える。一人称ならその場に立つ。 */
+      setViewMode(mode: ViewMode): void;
+      /** テスト用: 一人称で (x, z) へ立たせ、yaw / pitch を向ける。y を渡すとその高さから落とす。 */
+      stand(x: number, z: number, yaw?: number, pitch?: number, y?: number): void;
       /** テスト用: 制御点を置いて線形を引き、そのまま着工する */
       road(points: [number, number][], stdId?: string): RoadPlan | null;
       /** テスト用: 着工せずに見積りだけ返す */
@@ -810,7 +984,22 @@ window.__game = {
   engine, rig, field, chunks, economy, excavator, toolbar, tunnels, time,
   survey, section, THREE, TunnelNetwork, raycastTerrain, overburdenAt,
   repose, heightIndex, slopeInfoAt, slopeWorks, crew, roads, bridges,
+  fp, vegetation,
   ready: true,
+  setViewMode,
+  stand(x, z, yaw = 0, pitch = 0, y) {
+    setViewMode('fp');
+    fp.player.placeAt(field, x, z);
+    if (y !== undefined) {
+      // 坑道の中に立たせたいときはここを使う。上から降ろすと山の上に乗る。
+      fp.player.pos.y = y;
+      fp.player.vel.set(0, 0, 0);
+      fp.player.resolve(field);
+    }
+    fp.player.yaw = yaw;
+    fp.player.pitch = pitch;
+    fp.update(field, 0.016);
+  },
   previewRoad(points, stdId) {
     control.length = 0;
     for (const p of points) control.push({ x: p[0], z: p[1] });
